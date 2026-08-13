@@ -1,1 +1,11 @@
-"""Domain layer: enums, state machine, exceptions. Empty in phase 1."""
+"""Domain layer: channels, statuses, transitions, and named errors.
+
+This package must not import FastAPI, Pydantic, SQLAlchemy, Redis, or Celery.
+"""
+
+from app.domain.enums import Channel, NotificationStatus
+
+__all__ = [
+    "Channel",
+    "NotificationStatus",
+]
