@@ -5,12 +5,13 @@ requests, the API persists and enqueues them, workers dispatch across channels
 (email, SMS, push, webhook), and Redis Token Bucket rate limiting protects the
 HTTP path. **Day-to-day development is a local Python 3.12 venv** — not Docker.
 
-> **Phase 1 status:** only `GET /health` exists. Product routes (`/api/v1/...`),
-> Postgres, Redis, and Celery arrive in later `PLAN.md` rewrites.
+> **Phase 2 status:** `GET /health`, fail-fast `SECRET_KEY`, and structured
+> logging with `X-Request-ID`. Product routes (`/api/v1/...`), Postgres, Redis,
+> and Celery arrive in later `PLAN.md` rewrites.
 
 ## Target architecture
 
-Today the HTTP path is just the health router. The diagram below is the
+Today the HTTP path is health + request-id correlation. The diagram below is the
 **target** shape once later phases land:
 
 ```mermaid
@@ -31,7 +32,7 @@ flowchart LR
 - Python **3.12**
 - [`uv`](https://github.com/astral-sh/uv) (venv + package install)
 
-Postgres and Redis are **later phases**. Do not install them for this skeleton.
+Postgres and Redis are **later phases**. Do not install them for this slice.
 
 ## Setup
 
@@ -39,19 +40,28 @@ Postgres and Redis are **later phases**. Do not install them for this skeleton.
 uv venv .venv --python 3.12
 source .venv/bin/activate
 uv pip install -e ".[dev]"
+cp .env.example .env
 ```
 
-Optional: copy `.env.example` to `.env` and adjust `APP_NAME` / `ENVIRONMENT`.
+`SECRET_KEY` is **required** (≥16 characters). Without it the process fails at
+boot (`ValidationError`) instead of starting with empty config. Edit `.env` after
+copying `.env.example`.
 
 ## Run
 
 ```bash
+cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl -i http://127.0.0.1:8000/health
+# HTTP/1.1 200 OK
+# X-Request-ID: <uuid>
 # {"status":"ok"}
+
+curl -i -H 'X-Request-ID: demo-1' http://127.0.0.1:8000/health
+# response echoes X-Request-ID: demo-1
 ```
 
 ## Tests
