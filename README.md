@@ -5,9 +5,10 @@ requests, the API persists and enqueues them, workers dispatch across channels
 (email, SMS, push, webhook), and Redis Token Bucket rate limiting protects the
 HTTP path. **Day-to-day development is a local Python 3.12 venv** — not Docker.
 
-> **Phase 2 status:** `GET /health`, fail-fast `SECRET_KEY`, and structured
-> logging with `X-Request-ID`. Product routes (`/api/v1/...`), Postgres, Redis,
-> and Celery arrive in later `PLAN.md` rewrites.
+> **Phase 3 status:** domain states exist; still no `/send`. `GET /health`,
+> fail-fast `SECRET_KEY`, and structured logging with `X-Request-ID`. Product
+> routes (`/api/v1/...`), Postgres, Redis, and Celery arrive in later
+> `PLAN.md` rewrites.
 
 ## Target architecture
 
