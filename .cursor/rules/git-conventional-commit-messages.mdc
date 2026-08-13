@@ -1,0 +1,24 @@
+---
+description: Commit, push, and PRs only when EsrgaN asks. Conventional Commits in English. Never to main.
+alwaysApply: true
+---
+# Git
+
+Do **not** commit, push, or open a PR unless EsrgaN explicitly asks.
+
+- Base branch: `main`. Never commit or push to `main`.
+- Branches: `feat/`, `fix/`, `chore/`, `docs/`, `test/`, `refactor/` + kebab-case English.
+- Conventional Commits, English, why in the body:
+
+```
+feat: enqueue notifications before returning 202
+
+Keep the HTTP path free of provider I/O so clients
+get a stable notification_id under load.
+```
+
+Allowed types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`, `ci`.
+
+- One concern per commit. Never commit `.env` or secrets.
+- No `--no-verify`, no force-push to `main`, no interactive git (`-i`).
+- PRs via `gh pr create` with Summary (what + why) and Test plan.

@@ -1,0 +1,29 @@
+---
+description: Pytest is the gate. Unit for domain/limiter; integration for HTTP; never mock our domain or hit live vendors.
+globs: tests/**/*.py,**/conftest.py,**/pyproject.toml
+alwaysApply: false
+---
+# Tests
+
+A slice is not done until pytest ran. Runner is `pytest` only.
+
+| Change | Required tests |
+| --- | --- |
+| Domain / bucket / backoff | Unit, prefer with the code |
+| Pydantic schemas | Accept + reject cases |
+| New endpoint | Integration: 202, 401, 422, 429 as applicable |
+| Worker / DLQ | Unit with a fake provider |
+
+```python
+# BAD
+time.sleep(2)  # waiting for a live worker
+client.messages.create(...)  # real Twilio in tests
+
+# GOOD
+provider.send.side_effect = [TimeoutError(), None]
+# or: queue_port.enqueue.assert_called_once_with(notification_id)
+```
+
+- Mock **external providers**, not our domain/state machine.
+- Celery: eager mode or assert the queue port was called. Do not require a live worker for unit tests.
+- No 100% glue coverage hunt. Business rules cannot land without a test that would fail if the rule disappeared.

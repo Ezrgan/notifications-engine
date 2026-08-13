@@ -1,0 +1,13 @@
+---
+description: Clean Python for this repo — names, SRP, why-comments, no magic numbers or dumping-ground utils.
+globs: "**/*.py"
+alwaysApply: false
+---
+# Clean code
+
+- Names reveal purpose. No `data`, `temp`, `helpers.py`, `misc.py`, `app/utils/` without a real name and two call sites.
+- Functions do one thing. Type-hint anything that crosses a layer.
+- Comments explain **why**, not syntax. No `print`; structured logs with `notification_id` / `client_id` / `channel`.
+- Magic numbers belong in settings (`RATE_LIMIT_PER_MINUTE = 10`, retry countdowns), not literals in tasks.
+- `except Exception: pass` is forbidden. Catch the narrowest exception you can handle.
+- Leave the file cleaner than you found it; do not mix a reformat of the whole module into a behavior change.

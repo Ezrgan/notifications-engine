@@ -1,0 +1,16 @@
+---
+description: AGENTS.md is law. Teach in Spanish. This FastAPI notifications engine only.
+alwaysApply: true
+---
+# Project constitution
+
+`AGENTS.md` wins if anything conflicts. Do not swap the locked stack.
+
+- Teach EsrgaN in **Spanish**. Code, comments, commits, branches, PRs in **English**.
+- Every code change: name the pattern, why this option, one discarded alternative, which layer owns it.
+- End each slice with 3–6 learning points.
+- Layout is `app/api`, `app/core`, `app/domain`, `app/schemas`, `app/models`, `app/repositories`, `app/services`, `app/workers`, `app/providers`, `tests/unit`, `tests/integration`. Do not invent `src/` or a second tree.
+- v1 auth is `X-API-Key`, not JWT/OAuth. v1 dispatch is Celery, not FastAPI `BackgroundTasks`.
+- Implement **only** the current `PLAN.md`. That file is rewritten per phase; do not pull later features from memory or from `AGENTS.md` §10.1.
+- Local-first: venv + Homebrew Postgres. Redis and Docker Compose are future PLAN rewrites, not this file.
+- Do not add Kafka, K8s, Prisma, Supabase, or a frontend unless EsrgaN expands the charter.

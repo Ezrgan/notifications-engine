@@ -1,0 +1,13 @@
+---
+description: Keep slices small. AGENTS.md folder layout is requested scope, not extra abstraction.
+alwaysApply: true
+---
+# Anti-over-engineering
+
+Only change what was asked. Simplest solution that still respects `AGENTS.md`. When unsure, ask.
+
+Do not add Kafka, extra brokers, JWT, new top-level trees, unused dependencies, or rewrite a file for a one-line fix.
+
+Ports/adapters, Token Bucket in Redis, Alembic, and the `app/` layout are **in the charter** — implementing them is not over-engineering. `import twilio` inside a worker is.
+
+Before delivery: only requested files, no speculative helpers, tests for new business rules.
