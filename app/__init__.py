@@ -1,0 +1,1 @@
+"""Notifications engine application package."""
