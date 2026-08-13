@@ -1,113 +1,76 @@
-# PLAN.md — Fase 2: Settings fail-fast y logging estructurado
+# PLAN.md — Fase 3: Dominio (canales, estados, transiciones, excepciones)
 
 > **REGLA OBLIGATORIA PARA TODOS LOS AGENTES:**
-> Antes de ejecutar cualquier paso, leer y acatar [`AGENTS.md`](./AGENTS.md) y `.cursor/rules/`.
-> Este archivo es el **único plan ejecutable**. Describe **una sola fase**. Cuando cierre, EsrgaN **reescribe** `PLAN.md` entero. No implementar dominio, SQLAlchemy, Alembic, Celery, Redis, Token Bucket, `POST /send`, métricas ni Docker.
+> Antes de ejecutar cualquier paso, leer y acatar [`AGENTS.md`](./AGENTS.md), [`.cursor/rules/`](./.cursor/rules/) y [`docs/HOW_TO_WRITE_THE_NEXT_PLAN.md`](./docs/HOW_TO_WRITE_THE_NEXT_PLAN.md).
+> Este archivo es el **único plan ejecutable**. Describe **una sola fase**. Cuando cierre, EsrgaN **reescribe** `PLAN.md` entero (ver el playbook en `docs/`).
+> No implementar SQLAlchemy, Alembic, Celery, Redis, Token Bucket, `POST /send`, handlers HTTP de errores, métricas ni Docker.
 
 > **Cómo está pensado este documento:**
-> Un agente debe poder implementarlo **sin inventar**. Cada paso dice: archivos exactos, contrato de código, comando, test, commit propuesto y qué **no** tocar.
-> Política anti-pereza: código completo y funcional. Cero placeholders, cero `# ... rest of code ...`, cero `pass` que finjan una feature.
+> Un agente debe poder implementarlo **sin inventar**. Cada paso: archivos exactos, contrato, tests, commit propuesto, qué no tocar.
+> Código completo. Cero placeholders. Cero `# ... rest of code ...`.
+> Enseñar a EsrgaN en **español simple**, con ejemplos. Sin jerga sin definir.
 
-> **Estado de partida (verificado en `feat/phase-1-skeleton`, commit `24f06db`):**
-> Fase 1 **cerrada y verde**. `pytest -q` → 1 passed. `ruff check app tests` limpio. `GET /health` → 200 `{"status":"ok"}`. No hay Dockerfile ni Compose. Settings actuales son **fail-soft** (`app_name` / `environment` con default). `get_settings` usa `lru_cache`. `app = create_app()` se ejecuta al importar `app.main`. Postgres/Redis de la máquina **no se tocan**.
+> **Estado de partida (verificado en `feat/phase-2-settings-logging`, commit `e4f8589`):**
+> Fase 2 **cerrada y verde**. `pytest -q` → 11 passed. `SECRET_KEY` obligatorio (`SecretStr`, min 16). Logging stdlib + `X-Request-ID`. `GET /health` → 200 `{"status":"ok"}`. `app/domain/` solo tiene `__init__.py` vacío de lógica. Cero modelos ORM. Cero Dockerfile.
 
 ---
 
 ## 0. Decisiones congeladas (esta fase)
 
-Si un paso parece contradecirlas, manda esta tabla.
-
 | # | Decisión | Valor congelado |
 | --- | --- | --- |
-| D1 | Qué falla rápido **ahora** | `secret_key` es **obligatorio**. Tipo `pydantic.SecretStr`, `min_length=16`. Sin default. Sin `SECRET_KEY` (ni en env ni en `.env`), `Settings()` lanza `ValidationError` y el proceso **no arranca**. |
-| D2 | Qué **no** se vuelve obligatorio aún | `DATABASE_URL` y `REDIS_URL` siguen **ausentes** del modelo. No conectamos a Postgres ni a Redis. Exigirlas ahora obligaría a mentir con URLs que nadie usa. El *patrón* fail-fast se enseña con `secret_key`. |
-| D3 | `environment` | `Literal["local", "test", "production"]`, default `"local"`. Cualquier otro valor (p.ej. `dev`) → `ValidationError`. |
-| D4 | `log_level` | `Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]`, default `"INFO"`. Aceptar minúsculas en el env y **normalizar a mayúsculas** con un `field_validator` `before`. |
-| D5 | Logging | Solo stdlib `logging`. **No** instalar `structlog` ni `python-json-logger`. Formatter propio en `app/core/logging.py`. |
-| D6 | Formato | `local` y `test` → texto en una línea (legible en terminal/pytest). `production` → **una línea JSON** por record (stdout). |
-| D7 | Campos extra reservados | El formatter incluye, si vienen en el record: `request_id`, `notification_id`, `client_id`, `channel`, `status`, `retry_count`. Hoy casi siempre vendrá solo `request_id`. **Nunca** loguear `secret_key` ni headers `Authorization` / `X-API-Key`. |
-| D8 | Request ID | Middleware ASGI o `BaseHTTPMiddleware` en `app/api/middleware/request_id.py`. Lee `X-Request-ID` o genera `uuid4`. Lo guarda en un `ContextVar`. Lo **devuelve** en la respuesta. Un `logging.Filter` copia el valor al record. |
-| D9 | Lifespan | `create_app` registra un `lifespan` que llama `configure_logging(settings)` y emite `application_started` con `environment` (no el secreto). No usar `@app.on_event` (deprecado). |
-| D10 | Health | Sigue `GET /health` → 200 `{"status":"ok"}`. **No** añadir `environment` al payload. **No** loguear cada hit de `/health` a INFO (Uvicorn ya hace access log). |
-| D11 | Tests vs import de `app.main` | `app = create_app()` corre al importar. `tests/conftest.py` **debe** hacer `os.environ.setdefault("SECRET_KEY", ...)` **antes** de `from app.main import create_app`. Los unit tests de “falta el secreto” instancian `Settings(_env_file=None)` y **no** importan `app.main`. |
-| D12 | Caché | Fixture `autouse` que hace `get_settings.cache_clear()` al entrar y al salir. Si no, un test deja Settings pegado al proceso. |
-| D13 | Docker / Redis / SQLAlchemy / Celery / dominio | **Prohibidos.** No nuevos paquetes en `pyproject.toml`. |
-| D14 | Git | Rama `feat/phase-2-settings-logging` desde el HEAD actual (`feat/phase-1-skeleton`). Commits **solo si EsrgaN lo pide**. Un commit por paso. No fusionar a `main` salvo que lo pida. |
-| D15 | Enseñanza | Explicar en español. Al cerrar: 3–6 learning points. |
+| D1 | Capa | Solo `app/domain/`. **Cero** imports de FastAPI, Pydantic, SQLAlchemy, Redis, Celery. Stdlib only (`enum`, excepciones). |
+| D2 | `Channel` | `enum.StrEnum`: `EMAIL = "email"`, `SMS = "sms"`, `PUSH = "push"`, `WEBHOOK = "webhook"`. Esos cuatro. No `whatsapp`, no `slack`. |
+| D3 | `NotificationStatus` | `enum.StrEnum`: `PENDING`, `PROCESSING`, `SENT`, `FAILED`. Valores string exactamente `"PENDING"`, `"PROCESSING"`, `"SENT"`, `"FAILED"` (mayúsculas, para que coincidan con el contrato de `GET /status` más adelante). |
+| D4 | Transiciones **legales** | `PENDING → PROCESSING`. `PROCESSING → SENT`. `PROCESSING → FAILED`. `PROCESSING → PENDING` (reintento: vuelve a cola). |
+| D5 | Estados **terminales** | `SENT` y `FAILED` no salen a ningún sitio. `SENT → PENDING`, `FAILED → SENT`, `FAILED → PROCESSING`, etc. son ilegales. |
+| D6 | Atajos ilegales | `PENDING → SENT` y `PENDING → FAILED` son ilegales. Hay que pasar por `PROCESSING`. |
+| D7 | API de la máquina | Tres funciones en `state_machine.py`: `can_transition(src, dst) -> bool`, `assert_transition(src, dst) -> None` (explota si ilegal), `transition(src, dst) -> NotificationStatus` (devuelve `dst` si legal). No una clase gigante. No un grafo genérico configurable. |
+| D8 | Excepciones | Base `DomainError(Exception)`. Hija `InvalidStatusTransition(DomainError)` con atributos `from_status` y `to_status`. **No** mapear a HTTP en esta fase (no hay rutas de producto). **No** crear 15 clases “por si acaso”. |
+| D9 | Qué **no** entra | Validar formato de email/teléfono. `retry_count`. Idempotencia. Cola. Persistencia. Schemas Pydantic de `/send`. |
+| D10 | Tests | `tests/unit/domain/`. Sin `TestClient`. Sin `SECRET_KEY` extra (estos tests no importan `app.main`). |
+| D11 | Git | Rama `feat/phase-3-domain` desde `feat/phase-2-settings-logging` (HEAD actual). Commits **solo si EsrgaN lo pide**. |
+| D12 | Docker / deps nuevas | Prohibidos. `pyproject.toml` no se toca. |
+| D13 | Docs de producto | No reescribir `README.md` salvo una línea de “Phase 3 status” **al final** del último paso. `docs/STATUS.md` se actualiza en el último paso. |
 
 ---
 
-## 1. Diagnóstico del estado actual (por qué esta fase)
+## 1. Diagnóstico (por qué esta fase)
 
-Auditoría sobre el código real de `feat/phase-1-skeleton`.
-
-1. **`Settings` no puede fallar.** [`app/core/config.py`](app/core/config.py) solo tiene `app_name` y `environment` con default. Un `.env` vacío arranca igual. Eso viola `AGENTS.md` §6.3 *para secretos*; todavía no para URLs de IO (D2).
-2. **`lru_cache` + `app = create_app()` al importar** implica: el primer `import app.main` congela Settings. Los tests de la fase 1 no limpian la caché porque no hacía falta. En cuanto `secret_key` sea obligatorio, el orden de `conftest.py` **es** el bug o el arreglo.
-3. **No hay logging de aplicación.** Cualquier `print` futuro o logger sin configurar sale sin correlación. El `ContextVar` + filter es el gancho donde más adelante colgaremos `notification_id` sin reescribir los routers.
-4. **Fase 1 OK (no revertir):** árbol `app/` correcto, health test verde, Ruff verde, README local, cero Docker. Un único commit de skeleton (en vez de un commit por paso) es aceptable; no reescribir historia.
-
-Nits que **no** bloquean (el agente no tiene que “arreglar el mundo”): pueden existir `.DS_Store` locales (ya están en `.gitignore`). Hay un warning de Starlette/httpx en pytest: **no** pelearse con eso en esta fase.
+1. Health y settings ya arrancan. El **negocio** (qué estados existen, cuáles se pueden cambiar) todavía no está en código. Si saltamos a Postgres, el status sería un string libre en la columna y `SENT → PENDING` se podría guardar sin que nadie proteste.
+2. El dominio **antes** de la BD es a propósito: las reglas se testean sin Postgres. La tabla, más adelante, solo guarda lo que el dominio ya permite.
+3. Excepciones propias: un `ValueError("bad")` no dice si falló el estado, la key o el JSON. `InvalidStatusTransition` sí.
 
 ---
 
-## 2. Arquitectura objetivo al cerrar esta fase
-
-Árbol **final**. Si un archivo no está en esta lista como NUEVO o EDITADO, no se crea. No borrar los `__init__.py` vacíos de dominio/models/etc.
+## 2. Árbol al cerrar esta fase
 
 ```text
-notifications-engine/
-├── AGENTS.md                          # no tocar
-├── PLAN.md                            # este archivo
-├── .env.example                       # EDITAR: SECRET_KEY obligatorio
-├── README.md                          # EDITAR: arranque exige SECRET_KEY
-├── pyproject.toml                     # NO tocar dependencias
-├── app/
-│   ├── main.py                        # EDITAR: lifespan + middleware
-│   ├── core/
-│   │   ├── config.py                  # EDITAR: secret_key, environment, log_level
-│   │   └── logging.py                 # NUEVO
-│   └── api/
-│       └── middleware/
-│           ├── __init__.py            # puede reexportar el middleware (opcional)
-│           └── request_id.py          # NUEVO
-├── tests/
-│   ├── conftest.py                    # EDITAR: env + cache_clear ANTES del import
-│   ├── unit/
-│   │   ├── test_config.py             # NUEVO
-│   │   └── test_logging.py            # NUEVO
-│   └── integration/
-│       ├── test_health.py             # no romper
-│       └── test_request_id.py         # NUEVO
+app/domain/
+  __init__.py              # EDITAR: reexportar Channel, NotificationStatus, DomainError, InvalidStatusTransition, can_transition, assert_transition, transition
+  enums.py                 # NUEVO
+  exceptions.py            # NUEVO
+  state_machine.py         # NUEVO
+tests/unit/domain/
+  __init__.py              # NUEVO (vacío o docstring de una línea)
+  test_enums.py            # NUEVO (corto)
+  test_state_machine.py    # NUEVO (el gordo)
+docs/STATUS.md             # EDITAR en el último paso
+README.md                  # EDITAR una línea de status
 ```
 
-Flujo de arranque:
-
-```text
-import/create_app
-  -> get_settings()          # ValidationError si falta SECRET_KEY
-  -> FastAPI(lifespan=...)
-  -> add RequestIdMiddleware
-  -> include health
-lifespan startup
-  -> configure_logging(settings)
-  -> log application_started  # sin secret_key
-GET /health
-  -> middleware asigna request_id
-  -> {"status":"ok"} + header X-Request-ID
-```
+No crear `app/domain/entities.py`, ni `retry_policy.py`, ni handlers en `app/main.py`.
 
 ---
 
-## 3. Convención Git de esta fase
+## 3. Git
 
 ```bash
-git checkout feat/phase-1-skeleton    # si no estás ahí
-git checkout -b feat/phase-2-settings-logging
+git checkout feat/phase-2-settings-logging
+git checkout -b feat/phase-3-domain
 ```
 
-Si la rama ya existe, usarla; no recrearla.
-
-Verificación **antes de cerrar cada paso que toque código**:
+Antes de cerrar cada paso de código:
 
 ```bash
 source .venv/bin/activate
@@ -115,296 +78,169 @@ pytest -q
 ruff check app tests
 ```
 
-`pytest` debe seguir incluyendo `test_health_returns_ok` en verde.
+Los 11 tests de la Fase 2 deben seguir verdes.
 
 ---
 
-## FASE 0 — Preparación (sin commit de producto)
+## FASE 0 — Preparación
 
-- [ ] **Paso 0.1** — Rama correcta y árbol limpio de Docker:
-
-```bash
-git status -sb
-# esperado: feat/phase-1-skeleton o ya feat/phase-2-settings-logging
-ls Dockerfile docker-compose.yml
-# esperado: No such file
-```
-
-- [ ] **Paso 0.2** — Baseline verde **antes** de tocar código:
-
-```bash
-source .venv/bin/activate
-pytest -q
-ruff check app tests
-```
-
-Si esto falla, **detenerse**. No empezar la Fase 2 sobre un skeleton roto.
-
-- [ ] **Paso 0.3** — Crear la rama `feat/phase-2-settings-logging` desde el HEAD del skeleton.
-
-**Checklist Fase 0**
-- [ ] pytest verde (1+ passed)
-- [ ] ruff verde
-- [ ] rama de fase creada
-- [ ] cero contenedores arrancados por el agente
+- [ ] `pytest -q` → 11 passed (o más, todos verdes)
+- [ ] `ruff check app tests` limpio
+- [ ] No existe `app/domain/enums.py` todavía
+- [ ] Rama `feat/phase-3-domain` creada
+- [ ] Cero Docker, cero `pip install` nuevo
 
 ---
 
-## FASE 2 — Settings fail-fast + logging
+## FASE 3 — Dominio
 
-> **Objetivo:** el proceso **no arranca** sin `SECRET_KEY`; los logs son estructurados y correlacionables con `X-Request-ID`; `/health` sigue igual.
-> **Regla de oro:** no se añade IO real (DB, Redis, proveedores).
+### Paso 3.1 — Enums
 
-### Paso 2.1 — `Settings` fail-fast
+Crear [`app/domain/enums.py`](app/domain/enums.py).
 
-Editar [`app/core/config.py`](app/core/config.py). Reemplazar el modelo mínimo de la fase 1. Contrato exacto:
+Usar `class Channel(StrEnum)` y `class NotificationStatus(StrEnum)` de `enum` (stdlib, Python 3.12). **No** `enum.Enum` con `.value` raro: `StrEnum` se compara y se serializa como string.
 
-- Seguir usando `pydantic_settings.BaseSettings` y `SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")`.
-- Campos:
-  - `app_name: str = "notifications-engine"`
-  - `environment: Literal["local", "test", "production"] = "local"`
-  - `log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"`
-  - `secret_key: SecretStr` — **sin default**. `Field(min_length=16)`.
-- Validator `mode="before"` sobre `log_level`: si llega `str`, hacer `.upper()`. Así `log_level=info` en `.env` funciona.
-- `get_settings()` sigue con `@lru_cache` y `return Settings()`.
-- Docstring del módulo: explicar **por qué** `DATABASE_URL` no está aún (no hay IO; no mentir).
-- `SecretStr` para que `repr(settings)` no imprima el secreto.
-
-No añadir `database_url`. No añadir `redis_url`.
-
-Editar [`.env.example`](.env.example) para que `SECRET_KEY` esté **descomentado** y tenga ≥16 caracteres de placeholder, p.ej.:
-
-```env
-APP_NAME=notifications-engine
-ENVIRONMENT=local
-LOG_LEVEL=INFO
-SECRET_KEY=dev-secret-change-me
-# Unused until later PLAN.md rewrites (we do not connect yet):
-# DATABASE_URL=postgresql+psycopg://USER@localhost:5432/notifications_engine
-# REDIS_URL=redis://localhost:6379/0
-```
-
-Si EsrgaN tiene un `.env` local, **no commitearlo**. En el chat, recordarle que copie el nuevo `SECRET_KEY` o `uvicorn` morirá al arrancar. El agente puede crear `.env` local **solo si no existe**, copiando `.env.example`; sigue gitignored.
-
-- [ ] `Settings(_env_file=None)` sin `SECRET_KEY` en el entorno lanza `ValidationError`
-- [ ] `secret_key` no aparece en claro en `repr(Settings(...))`
-- **Commit (si EsrgaN autoriza):**
-
-```text
-feat: require a secret key so the app fails fast on boot
-
-Refuse to start with a missing or short SECRET_KEY instead of
-running with silent empty config.
-```
-
----
-
-### Paso 2.2 — Tests unitarios de Settings + conftest a prueba de import
-
-**Orden en [`tests/conftest.py`](tests/conftest.py) (crítico):**
-
-1. `import os` y `os.environ.setdefault("SECRET_KEY", "pytest-secret-key")` (≥16 chars).
-2. `os.environ.setdefault("ENVIRONMENT", "test")`.
-3. **Después** de eso: `from app.core.config import get_settings` y `from app.main import create_app`.
-4. Fixture `autouse=True` `_reset_settings_cache` que llama `get_settings.cache_clear()` before/after.
-
-Si se importa `app.main` arriba del `setdefault`, `create_app()` explota o congela un Settings viejo. Ese es el bug de D11.
-
-Crear [`tests/unit/test_config.py`](tests/unit/test_config.py):
-
-1. `test_missing_secret_key_fails_fast(monkeypatch)`  
-   - `monkeypatch.delenv("SECRET_KEY", raising=False)`  
-   - `with pytest.raises(ValidationError): Settings(_env_file=None)`  
-   - **No** importar `create_app` en este test.
-
-2. `test_secret_key_shorter_than_16_fails(monkeypatch)`  
-   - `monkeypatch.setenv("SECRET_KEY", "short")`  
-   - `Settings(_env_file=None)` → `ValidationError`.
-
-3. `test_valid_secret_key_is_not_in_repr(monkeypatch)`  
-   - `monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")`  
-   - `s = Settings(_env_file=None)`  
-   - `assert "pytest-secret-key" not in repr(s)`  
-   - `assert s.secret_key.get_secret_value() == "pytest-secret-key"`
-
-4. `test_invalid_environment_fails(monkeypatch)`  
-   - `SECRET_KEY` válido + `ENVIRONMENT=dev` → `ValidationError`.
-
-5. `test_log_level_is_normalized_to_uppercase(monkeypatch)`  
-   - `LOG_LEVEL=info` → `settings.log_level == "INFO"`.
-
-Ejecutar `pytest -q`. Health sigue verde.
-
-- [ ] Unit tests de config en verde
-- [ ] `test_health_returns_ok` sigue en verde
-- **Commit (si EsrgaN autoriza):**
-
-```text
-test: cover fail-fast settings and isolate Settings from .env
-
-Lock boot-time ValidationError and keep TestClient imports from
-crashing once SECRET_KEY is required.
-```
-
----
-
-### Paso 2.3 — Logging estructurado
-
-Crear [`app/core/logging.py`](app/core/logging.py). Contrato:
-
-**a) `request_id_ctx: ContextVar[str]`**
-
-- Default `"-"`.
-- Definirla **aquí** (un solo sitio). El middleware del paso 2.4 solo hace `.set()` / `.reset()`.
-
-**b) `class RequestIdFilter(logging.Filter)`**
-
-- `filter(self, record)`: `record.request_id = request_id_ctx.get()` y `return True`.
-- Así ningún `logger.info` tiene que acordarse del request id.
-
-**c) Formatters**
-
-- Texto (local/test): incluir asctime, level, name, request_id, message. Si el record trae `notification_id` / `client_id` / `channel` / `status` / `retry_count`, añadirlos al final como `key=value`. No imprimir claves ausentes.
-- JSON (production): `json.dumps` de un dict con `timestamp`, `level`, `logger`, `message`, `request_id`, y las mismas claves extra **solo si existen**. `ensure_ascii=True`, una línea, `default=str`. Nunca incluir `secret_key`.
-
-**d) `configure_logging(settings: Settings) -> None`**
-
-- Idempotente: si el logger `"app"` (o el root que elijáis — **congelado: logger `"app"`** y también configurar el root para no perder logs de librerías a WARNING) ya tiene nuestros handlers, **no duplicar**. Receta simple y obligatoria:
-  1. `root = logging.getLogger()`
-  2. `root.handlers.clear()`
-  3. nivel desde `settings.log_level`
-  4. un `StreamHandler(sys.stdout)` con el formatter según `settings.environment`
-  5. añadir `RequestIdFilter()` al handler
-- No usar `basicConfig` a medias y esto a la vez (doble handler).
-- No loguear el `secret_key`.
-
-**e) Logger de aplicación**
-
-- Convención: `logging.getLogger("app")` o `logging.getLogger(__name__)` dentro de `app.*`. Con root configurado, ambos salen.
-
-Unit tests en [`tests/unit/test_logging.py`](tests/unit/test_logging.py):
-
-1. Construir `Settings(_env_file=None)` con `SECRET_KEY` de test y `ENVIRONMENT=production`, `LOG_LEVEL=INFO`.
-2. `configure_logging(settings)`.
-3. Usar un `StreamHandler` sobre `io.StringIO` **o** inspeccionar el handler que `configure_logging` acaba de colgar del root: loguear `logging.getLogger("app").info("hello", extra={"channel": "email"})`.
-4. Assert: el output JSON (`json.loads` de la línea) tiene `message` / `channel` == `"email"` y **no** contiene el secreto.
-5. Segundo test: `ENVIRONMENT=local` → el output **no** es JSON (no empieza por `{`), pero contiene `hello` y el `request_id` default `-` o el que se haya seteado.
-6. `configure_logging` dos veces no duplica handlers (`len(root.handlers)` no crece sin control; tras dos llamadas debe quedar **1** StreamHandler nuestro, o el número estable que documentéis en el test).
-
-Detalle: `handlers.clear()` en root puede silenciar pytest caplog. Por eso estos tests usan un `StringIO` enganchado **o** leen `handler.stream` tras configurar. Si hace falta, en tests de logging no uses `caplog` como única fuente.
-
-- [ ] JSON en production; texto en local
-- [ ] `extra={"channel": "email"}` sobrevive al formatter
-- [ ] configure_logging idempotente
-- **Commit (si EsrgaN autoriza):**
-
-```text
-feat: add structured logging with reserved correlation fields
-
-Emit JSON in production and keep request_id on every record so
-later notification_id can ride the same pipeline.
-```
-
----
-
-### Paso 2.4 — Request ID middleware + lifespan
-
-**a) [`app/api/middleware/request_id.py`](app/api/middleware/request_id.py)**
-
-Usar `starlette.middleware.base.BaseHTTPMiddleware` (suficiente en v1; no escribir un ASGI a mano salvo que ya lo dominéis).
+Contrato:
 
 ```python
-# Contrato de comportamiento, no hace falta copiar línea a línea:
-# - header de entrada: X-Request-ID (si viene no vacío, usarlo; si no, uuid4)
-# - request_id_ctx.set(valor) ANTES de call_next
-# - try/finally con reset del token del ContextVar (no filtrar request_ids entre requests)
-# - response.headers["X-Request-ID"] = valor
+Channel.EMAIL == "email"          # True
+NotificationStatus.PENDING == "PENDING"  # True
+list(Channel)                     # cuatro miembros
 ```
 
-No loguear a INFO aquí.
+No añadir métodos de negocio en el enum (eso va en `state_machine.py`).
 
-**b) [`app/main.py`](app/main.py)**
+Tests [`tests/unit/domain/test_enums.py`](tests/unit/domain/test_enums.py):
 
-- `lifespan` async contextmanager:
-  - startup: `settings = get_settings()`; `configure_logging(settings)`; `logging.getLogger("app").info("application_started", extra={"environment": settings.environment})`
-  - yield
-  - shutdown: `logging.getLogger("app").info("application_stopped")` (opcional pero simétrico)
-- `FastAPI(..., lifespan=lifespan)`
-- `application.add_middleware(RequestIdMiddleware)` **antes** de incluir routers (en Starlette, `add_middleware` envuelve por fuera).
-- Seguir incluyendo solo `health_router`.
-- `app = create_app()` al final, igual que ahora.
+- Hay exactamente esos cuatro channels y esos cuatro statuses.
+- `Channel.EMAIL == "email"`.
+- `NotificationStatus.SENT == "SENT"`.
 
-**c) [`tests/integration/test_request_id.py`](tests/integration/test_request_id.py)**
-
-1. `test_health_echoes_generated_request_id(client)`: `GET /health` sin header → 200, header `X-Request-ID` presente y no vacío.
-2. `test_health_preserves_incoming_request_id(client)`: `GET /health` con `headers={"X-Request-ID": "client-trace-1"}` → el response header es exactamente `client-trace-1`.
-
-`test_health_returns_ok` no se modifica (payload intacto).
-
-- [ ] Lifespan no usa `on_event`
-- [ ] Header round-trip cubierto
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-feat: correlate logs and responses with X-Request-ID
+feat: add channel and notification status enums
 
-Propagate a request id through a ContextVar so health (and later
-send) can be traced without logging secrets.
+Give the engine a closed set of channels and statuses before
+any database column exists to store them.
 ```
 
 ---
 
-### Paso 2.5 — README
+### Paso 3.2 — Excepciones
 
-Editar [`README.md`](README.md):
+Crear [`app/domain/exceptions.py`](app/domain/exceptions.py).
 
-- Decir que **hace falta** `SECRET_KEY` (≥16) en `.env` para arrancar.
-- Setup: `cp .env.example .env` antes de `uvicorn`.
-- Mencionar `X-Request-ID` (opcional en curl):
+```python
+class DomainError(Exception):
+    """Base for business-rule failures. HTTP mapping comes in a later phase."""
 
-```bash
-cp .env.example .env
-uvicorn app.main:app --reload --port 8000
-curl -i http://127.0.0.1:8000/health
-curl -i -H 'X-Request-ID: demo-1' http://127.0.0.1:8000/health
+
+class InvalidStatusTransition(DomainError):
+    def __init__(self, from_status: NotificationStatus, to_status: NotificationStatus) -> None:
+        self.from_status = from_status
+        self.to_status = to_status
+        super().__init__(
+            f"Cannot transition from {from_status} to {to_status}"
+        )
 ```
 
-- Seguir diciendo que Docker / Postgres / Redis no son de esta fase.
-- Actualizar la línea de “Phase 1 status” a **Phase 2**: health + fail-fast secret + structured logging.
+Importar los enums desde `app.domain.enums`, no al revés.
 
-No copiar `AGENTS.md`.
+No crear `NotFoundError` ni `UnauthorizedError` ahora: no hay repositorio ni auth de producto.
 
-- [ ] Un extraño con `.env.example` puede arrancar
+Un test corto en `test_state_machine.py` (paso 3.3) basta para la excepción; no hace falta un archivo de tests solo para la clase vacía. Si el agente quiere `tests/unit/domain/test_exceptions.py` con un test de atributos `from_status`/`to_status`, está permitido (un test, no una suite).
+
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-docs: require SECRET_KEY in the local runbook
+feat: add domain errors for illegal notification transitions
 
-Document fail-fast boot and request-id headers without implying
-Compose is ready.
+Raise a named error instead of a generic ValueError so later
+HTTP mapping can tell business rules from bugs.
 ```
 
 ---
 
-## 4. Checklist de cierre de la Fase 2
+### Paso 3.3 — Máquina de estados
 
-- [ ] `pytest -q` verde (health + config + logging + request id)
+Crear [`app/domain/state_machine.py`](app/domain/state_machine.py).
+
+Tabla congelada (no “config file”, un `frozenset` o dict módulo-level está bien):
+
+```text
+PENDING     -> {PROCESSING}
+PROCESSING  -> {SENT, FAILED, PENDING}
+SENT        -> {}
+FAILED      -> {}
+```
+
+Funciones públicas exactas:
+
+- `can_transition(src: NotificationStatus, dst: NotificationStatus) -> bool`
+- `assert_transition(src: NotificationStatus, dst: NotificationStatus) -> None`  
+  Si ilegal: `raise InvalidStatusTransition(src, dst)`. Si legal: no return útil.
+- `transition(src: NotificationStatus, dst: NotificationStatus) -> NotificationStatus`  
+  Llama a `assert_transition` y `return dst`. No muta ningún objeto (aún no hay entidad). Es una función pura.
+
+Misma transición (`PENDING → PENDING`) es **ilegal** salvo que esté en la tabla (no está).
+
+Tests [`tests/unit/domain/test_state_machine.py`](tests/unit/domain/test_state_machine.py) — **obligatorios**:
+
+1. Cada transición legal de D4: `can_transition` True y `transition` devuelve `dst`.
+2. `SENT → PENDING` → `InvalidStatusTransition` con `.from_status` y `.to_status` correctos.
+3. `FAILED → SENT` → misma excepción.
+4. `PENDING → SENT` → ilegal.
+5. `PENDING → FAILED` → ilegal.
+6. `SENT → SENT` → ilegal.
+7. Un test parametrizado (pytest `parametrize`) que recorra todas las parejas ilegales **o** al menos las de esta lista; no hace falta generar 4×4 si las 6 de arriba están. Preferir `parametrize` en las legales (4 casos) + las ilegales nombradas.
+
+Cero `TestClient`. Cero mocks.
+
+Editar [`app/domain/__init__.py`](app/domain/__init__.py): reexportar los nombres públicos (D1 del árbol). `__all__` explícito.
+
+- **Commit (si EsrgaN autoriza):**
+
+```text
+feat: encode legal notification status transitions
+
+Reject SENT→PENDING in the domain so a later ORM column cannot
+silently rewind a sent notification.
+```
+
+---
+
+### Paso 3.4 — Docs de status + README
+
+Editar [`docs/STATUS.md`](docs/STATUS.md): marcar Fase 3 hecha, listar `enums` / `state_machine` / excepciones, decir qué **sigue** (Postgres + Alembic, no send todavía).
+
+Editar [`README.md`](README.md): una línea “Phase 3 status: domain states exist; still no `/send`”.
+
+No copiar la máquina de estados al README (eso es `docs/STATUS.md`).
+
+- **Commit (si EsrgaN autoriza):**
+
+```text
+docs: record domain status machine in the project status note
+```
+
+---
+
+## 4. Checklist de cierre
+
+- [ ] `pytest -q` verde (Fase 2 + tests de dominio)
 - [ ] `ruff check app tests` limpio
-- [ ] Sin `SECRET_KEY`, `Settings(_env_file=None)` explota; con él, uvicorn arranca
-- [ ] `GET /health` sigue `{"status":"ok"}` y lleva `X-Request-ID`
-- [ ] Cero menciones de `secret_key` en líneas de log de los tests JSON
-- [ ] Cero deps nuevas en `pyproject.toml`
-- [ ] Cero Dockerfile / Alembic / Celery / SQLAlchemy
-- [ ] README actualizado
-- [ ] 3–6 learning points en español para EsrgaN
-- [ ] Commits de 2.1–2.5 hechos **o** mensajes propuestos esperando autorización
+- [ ] `app/domain/` no importa FastAPI/Pydantic/SQLAlchemy
+- [ ] Solo las transiciones de D4 son legales
+- [ ] `InvalidStatusTransition` se lanza en las ilegales
+- [ ] Cero routers nuevos, cero Alembic, cero Celery
+- [ ] 3–6 learning points en español **simple** para EsrgaN (qué es un enum, por qué el dominio no habla HTTP, ejemplo SENT→PENDING)
+- [ ] Commits hechos o mensajes esperando a EsrgaN
 
-**Prohibido al “terminar”:** modelos, `POST /send`, `brew install redis`, `celery`, `alembic init`, Docker.
+**Prohibido al terminar:** `alembic init`, modelos SQLAlchemy, `POST /send`, mapper HTTP de excepciones, Redis.
 
 ---
 
-## 5. Qué pasa después (no implementar)
+## 5. Qué sigue (no implementar)
 
-Cuando EsrgaN cierre esta fase, se **reemplaza** este `PLAN.md`. La siguiente pieza natural en `AGENTS.md` §10.1 es el **dominio**: enums de canal/estado, máquina de transiciones, excepciones, tests unitarios — todavía sin Postgres.
-
-No fusionar a `main` ni pushear a menos que EsrgaN lo pida.
+Siguiente `PLAN.md` (otra reescritura): **Postgres local + SQLAlchemy 2 Mapped + Alembic**. Las columnas `channel` y `status` usarán estos enums. No hay cola todavía.
