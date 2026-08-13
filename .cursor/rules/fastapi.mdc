@@ -1,0 +1,30 @@
+---
+description: FastAPI v1 contract — thin routers, API keys, 202, Token Bucket, Pydantic v2.
+globs: app/api/**/*.py,app/schemas/**/*.py,app/main.py,app/core/**/*.py
+alwaysApply: false
+---
+# FastAPI
+
+Routers stay thin: parse → service → map errors. No SQLAlchemy queries, no Celery internals, no provider SDKs in `app/api/`.
+
+```python
+# BAD — dispatch on the request path
+@router.post("/send")
+async def send(body: SendRequest):
+    await twilio_client.send(body)  # also: BackgroundTasks, JWT
+    return {"ok": True}  # 200
+
+# GOOD — accept work, return 202
+@router.post("/send", status_code=202)
+async def send(body: SendRequest, svc: NotificationService = Depends()):
+    result = await svc.accept(body)
+    return result  # notification_id
+```
+
+- Auth: `X-API-Key` via `Depends`. No JWT/OAuth/sessions in v1.
+- `POST /api/v1/notifications/send` → persist `PENDING`, enqueue, **202**.
+- Status `401` / `404` (no cross-client leak) / `422` / `429` (+ `Retry-After`) / `503`.
+- Rate limit: Redis Token Bucket, atomic, per API key, before persist. No in-memory counters.
+- Pydantic v2: `model_config = ConfigDict(...)`, `model_dump()`. Never `class Config` or `.dict()`.
+- Inject settings, session, Redis, queue port. Never construct them inside the endpoint.
+- One error shape: `{"detail": ..., "code": ...}`.

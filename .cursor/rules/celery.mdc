@@ -1,0 +1,27 @@
+---
+description: Celery workers — task payloads are ids, retries/DLQ live here, never import FastAPI routers.
+globs: app/workers/**/*.py,app/providers/**/*.py
+alwaysApply: false
+---
+# Celery and providers
+
+API path never sends. Worker path never exposes HTTP. Tasks receive **ids**, not ORM objects.
+
+```python
+# BAD
+from app.api.routers import send_notification
+send_notification.delay(notification_orm)
+from twilio.rest import Client  # in the task module
+
+# GOOD
+@celery_app.task(bind=True, max_retries=4)
+def deliver_notification(self, notification_id: str) -> None:
+    # load row, skip if SENT, call NotificationProvider port, map errors
+```
+
+- Backoff: 5s / 15s / 45s. Max 5 attempts via settings, not a magic literal.
+- Transient provider failures retry. Permanent 4xx-equivalent → `FAILED` without fake backoff.
+- After exhaustion: status `FAILED` + queue `notifications.dlq`.
+- Treat `SENT` as terminal (no double-send on retry).
+- Providers implement a port. v1 = simulated adapter. Worker must not `import twilio` / Mailtrap directly.
+- Retry policy belongs in the worker, not inside the adapter.

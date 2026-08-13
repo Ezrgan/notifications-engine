@@ -1,0 +1,30 @@
+---
+description: Python 3.12 Compose setup — pin images, non-root, healthchecks, no secrets in the image.
+globs: Dockerfile,Dockerfile.*,docker-compose*.yml,docker-compose*.yaml,.dockerignore
+alwaysApply: false
+---
+# Docker
+
+**Do not add Dockerfile/Compose until `PLAN.md` Phase 12** unless EsrgaN asks. Day-to-day is a local venv.
+
+Python 3.12, not Node. One Compose file: `app`, `db`, `redis`, `worker`, `beat` (beat may be a stub). `app` and `worker` share the same image, different command. Pin tags already on the machine when possible (`postgres:14`, not a surprise 16 pull).
+
+```dockerfile
+# BAD
+FROM python:latest
+USER root
+COPY .env .
+
+# GOOD
+FROM python:3.12-slim-bookworm
+# pin, non-root USER before CMD, no .env copied, HEALTHCHECK
+```
+
+- Pin tags. Never `:latest` for runtime images.
+- Layer cache: copy `pyproject.toml` → install → copy source.
+- `.dockerignore`: `.venv`, `.git`, `.env*`, `__pycache__`, `.pytest_cache`.
+- No secrets in Dockerfile, build args, or image layers. Env at runtime.
+- Named volumes for Postgres/Redis data. Bind mounts for local dev only.
+- Services on a Compose network; reference `db` / `redis` by name.
+- Logs to stdout/stderr. `depends_on` + healthchecks so the app waits for db/redis.
+- Fix broken containers by changing Dockerfile/Compose, not by undocumented `docker exec` patches.

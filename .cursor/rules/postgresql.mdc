@@ -1,0 +1,27 @@
+---
+description: PostgreSQL + SQLAlchemy 2 Mapped + Alembic-only migrations for this engine.
+globs: app/models/**/*.py,app/repositories/**/*.py,alembic/**/*.py,alembic.ini
+alwaysApply: false
+---
+# Persistence
+
+Stack: PostgreSQL 16, SQLAlchemy 2.0 `Mapped[]`, Alembic only. Not Prisma, not Flyway SQL (`V001__...`), not `create_all` as the migration story.
+
+- Public IDs: **UUID**. Do not add a parallel `BIGSERIAL` + `public_id` unless EsrgaN asks.
+- Timestamps: `TIMESTAMPTZ` / timezone-aware datetimes, not naive `TIMESTAMP`.
+- Hash API keys at rest. Unique `(client_id, idempotency_key)` when the key is present.
+- `NOT NULL` by default. FKs with explicit `ON DELETE`.
+- Parameterized queries only. No `SELECT *` in hand-written SQL.
+- Repositories own queries. Routers do not.
+
+```python
+# BAD
+Base.metadata.create_all(engine)
+session.execute(text(f"SELECT * FROM notifications WHERE id = '{nid}'"))
+
+# GOOD
+class Notification(Base):
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+```
+
+Alembic revisions live in `alembic/versions/*.py`. Every schema change is a migration. Sessions are request-scoped (API) or task-scoped (worker).
