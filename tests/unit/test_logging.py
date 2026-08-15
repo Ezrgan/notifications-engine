@@ -11,6 +11,8 @@ import pytest
 from app.core.config import Settings
 from app.core.logging import configure_logging
 
+_TEST_DATABASE_URL = "postgresql+psycopg://localhost:5432/notifications_engine_test"
+
 
 def configure_logging_and_capture(settings: Settings, stream: io.StringIO) -> None:
     """Configure logging then redirect the StreamHandler to ``stream``."""
@@ -25,6 +27,7 @@ def test_production_logging_emits_json_with_extras(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.setenv("LOG_LEVEL", "INFO")
     settings = Settings(_env_file=None)
@@ -45,6 +48,7 @@ def test_local_logging_emits_text_not_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
     monkeypatch.setenv("ENVIRONMENT", "local")
     monkeypatch.setenv("LOG_LEVEL", "INFO")
     settings = Settings(_env_file=None)
@@ -61,6 +65,7 @@ def test_local_logging_emits_text_not_json(
 
 def test_configure_logging_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
     monkeypatch.setenv("ENVIRONMENT", "local")
     monkeypatch.setenv("LOG_LEVEL", "INFO")
     settings = Settings(_env_file=None)

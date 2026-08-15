@@ -9,17 +9,24 @@ from fastapi import FastAPI
 from app.api.middleware.request_id import RequestIdMiddleware
 from app.api.routers.health import router as health_router
 from app.core.config import get_settings
+from app.core.db import create_engine_from_url, create_session_factory
 from app.core.logging import configure_logging
 
 
 @asynccontextmanager
-async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
-    """Configure logging once at startup; emit symmetric lifecycle lines."""
+async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+    """Configure logging and own the Postgres engine for the process lifetime."""
     settings = get_settings()
     configure_logging(settings)
     logger = logging.getLogger("app")
+
+    engine = create_engine_from_url(settings.database_url.get_secret_value())
+    application.state.engine = engine
+    application.state.session_factory = create_session_factory(engine)
+
     logger.info("application_started", extra={"environment": settings.environment})
     yield
+    engine.dispose()
     logger.info("application_stopped")
 
 
