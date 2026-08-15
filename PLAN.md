@@ -1,18 +1,21 @@
-# PLAN.md — Fase 4: Persistencia (SQLAlchemy 2 Mapped + Alembic + Postgres local)
+# PLAN.md — Fase 5: API keys (`X-API-Key` + hash en reposo + Depends)
 
 > **REGLA OBLIGATORIA PARA TODOS LOS AGENTES:**
-> Antes de ejecutar cualquier paso, leer y acatar [`AGENTS.md`](./AGENTS.md), [`.cursor/rules/`](./.cursor/rules/) (sobre todo `postgresql.mdc` y `testing.mdc`) y [`docs/HOW_TO_WRITE_THE_NEXT_PLAN.md`](./docs/HOW_TO_WRITE_THE_NEXT_PLAN.md).
+> Antes de ejecutar cualquier paso, leer y acatar [`AGENTS.md`](./AGENTS.md), [`.cursor/rules/`](./.cursor/rules/) (sobre todo `fastapi.mdc`, `postgresql.mdc` y `testing.mdc`) y [`docs/HOW_TO_WRITE_THE_NEXT_PLAN.md`](./docs/HOW_TO_WRITE_THE_NEXT_PLAN.md).
 > Este archivo es el **único plan ejecutable**. Describe **una sola fase**. Cuando cierre, EsrgaN **reescribe** `PLAN.md` entero (ver el playbook en `docs/`).
-> No implementar `POST /send`, auth `X-API-Key`, hash de keys, Redis, Token Bucket, Celery, providers, métricas, mapper HTTP de excepciones ni Docker.
+> No implementar `POST /send`, cola, Celery, Redis, Token Bucket, métricas, mapper HTTP de excepciones de dominio, JWT ni Docker.
 
 > **Cómo está pensado este documento:**
 > Un agente debe poder implementarlo **sin inventar**. Cada paso: archivos exactos, contrato, tests, commit propuesto, qué no tocar.
 > Código completo. Cero placeholders. Cero `# ... rest of code ...`.
 > Enseñar a EsrgaN en **español simple**, con ejemplos. Sin jerga sin definir.
 
-> **Estado de partida (verificado en `main`, commit `9a57e86`):**
-> Fase 3 **cerrada y mergeada** (PR #4). `pytest -q` → **27 passed**. `ruff check app tests` limpio.
-> Hay dominio (`Channel`, `NotificationStatus`, máquina de transiciones). `app/models/__init__.py` solo tiene un docstring. **No** existe `alembic.ini` ni `alembic/`. `pyproject.toml` **no** lista SQLAlchemy/Alembic/psycopg. Settings **no** exige `DATABASE_URL`. `GET /health` → 200 `{"status":"ok"}` sin I/O. Homebrew `psql (PostgreSQL) 14.19` está instalado. Cero Dockerfile.
+> **Estado de partida (verificado):**
+> `origin/main` = `be14f38` — squash merge del PR **#5** (`feat: persist clients and notifications on local Postgres (#5)`). Fase 4 **sí** está en `main` remoto.
+> El `main` **local** puede seguir en `9a57e86` hasta un `git checkout main && git pull` (estaba 1 commit atrás al escribir el PLAN).
+> `feat/phase-4-persistence` = `2116005` (mismo *tree* que `be14f38`; el SHA cambia por el squash).
+> `pytest -q` → **33 passed**. `ruff check app tests` limpio.
+> Hay tablas `clients` / `notifications`, columna `hashed_api_key`, engine en el lifespan. **No** existe `app/core/security.py` ni `app/api/deps.py`. El único router público es `GET /health`. Cero JWT, cero Redis, cero Docker.
 
 ---
 
@@ -20,58 +23,26 @@
 
 | # | Decisión | Valor congelado |
 | --- | --- | --- |
-| D1 | Idea de la fase | Tablas reales en Postgres **local** (Homebrew 14.x). El dominio ya dice qué estados existen; ahora la BD los **guarda**. Cero envío, cero cola. |
-| D2 | Postgres | **14.x Homebrew**, `localhost:5432`. Ya está `14.19` en esta máquina. `.cursor/rules/postgresql.mdc` menciona 16: **gana `AGENTS.md`** (14+ / Homebrew 14). No actualizar a 16. No Docker. |
-| D3 | Bases | App: `notifications_engine`. Tests: `notifications_engine_test`. Nunca mezclar. Crearlas con `createdb` si no existen. |
-| D4 | Driver | `psycopg` v3 (paquete `psycopg[binary]`). URL **obligatoria** con prefijo `postgresql+psycopg://`. Rechazar `postgresql://`, `postgres://`, SQLite. |
-| D5 | ORM | SQLAlchemy **2.0** estilo `Mapped[]` / `mapped_column`. `DeclarativeBase` en `app/models/base.py`. **Prohibido** `create_all` en app, tests y scripts. **Prohibido** SQLAlchemy 1.4 `Query`. |
-| D6 | Migraciones | **Alembic only**. `alembic.ini` + `alembic/`. Una revisión que crea `clients` y `notifications`. `env.py` toma la URL de `Settings`, no de un string hardcodeado. |
-| D7 | Engine / Session | **Síncronos** (`Engine` + `Session`). `pool_pre_ping=True`. Creados en el **lifespan** de FastAPI; `engine.dispose()` al apagar. Guardar `engine` y `session_factory` en `app.state`. No `AsyncSession`, no `asyncpg`. |
-| D8 | Settings | `database_url: SecretStr` **obligatorio** (fail-fast, como `SECRET_KEY`). Validador: el valor debe empezar por `postgresql+psycopg://`. **No** default a un socket local oculto. `REDIS_URL` sigue **ausente**. |
-| D9 | Health | `GET /health` **no** abre sesión ni hace `SELECT 1`. Si Postgres está caído, health sigue 200. Liveness ≠ readiness. |
-| D10 | Tablas | Las **dos**: `clients` y `notifications`. `notifications.client_id` es FK a `clients.id` con `ON DELETE RESTRICT`. Auth HTTP (`X-API-Key`, hash helpers) es **Fase 5**; aquí solo existe la columna `hashed_api_key` (los tests insertan un string dummy). |
-| D11 | IDs y tiempo | PK `UUID` (default Python `uuid.uuid4`). Timestamps `DateTime(timezone=True)` / `TIMESTAMPTZ`. `created_at` / `updated_at` NOT NULL. `sent_at` nullable. |
-| D12 | Enums en columnas | Reusar `app.domain.enums.Channel` y `NotificationStatus`. SQLAlchemy `Enum(..., native_enum=False)` → **VARCHAR**, no tipo `ENUM` de Postgres (ALTER TYPE duele). El dominio sigue sin importar SQLAlchemy. |
-| D13 | JSON | `payload` = `JSONB` NOT NULL, default Python `dict` (no `default={}`). |
-| D14 | Idempotencia en BD | Índice único **parcial**: `(client_id, idempotency_key) WHERE idempotency_key IS NOT NULL`. Varias filas del mismo cliente con `idempotency_key` NULL **sí** se permiten. La política HTTP de replay es Fase 6. |
-| D15 | Repositorios / deps | **No** crear `NotificationRepository` ni `app/api/deps.py`. Los tests de persistencia usan `Session` de `session_factory`. El `Depends(get_db)` llega cuando un router de producto lo necesite. |
-| D16 | Tests | Unitarios de Settings **sin** Postgres. Persistencia = `tests/integration/test_persistence.py` contra Postgres **real** + `alembic upgrade` (no SQLite, no `create_all`, no `time.sleep`). Domain tests siguen sin importar SQLAlchemy. |
-| D17 | Git | Rama `feat/phase-4-persistence` desde `main` (`9a57e86`). Commits **solo si EsrgaN lo pide**. |
-| D18 | Docker / extras | Prohibidos. No Kafka, JWT, Prisma, Redis, Celery. No libs que `AGENTS.md` no nombre. |
-| D19 | Docs | `README.md`: Postgres local + `alembic upgrade head`. `docs/STATUS.md` se actualiza **al final** de la implementación (no en este turno de escritura del PLAN). |
-
-### Columnas congeladas
-
-**`clients`**
-
-| Columna | Tipo ORM | Restricciones |
-| --- | --- | --- |
-| `id` | `UUID` | PK, `default=uuid.uuid4` |
-| `name` | `String(128)` | NOT NULL |
-| `hashed_api_key` | `String(255)` | NOT NULL, UNIQUE. Cero key en claro. |
-| `is_active` | `bool` | NOT NULL, default `True` |
-| `rate_limit_per_minute` | `int \| None` | NULL = “usar el default global más adelante (10/min)”. No añadir ese default a Settings ahora. |
-| `created_at` | `DateTime(timezone=True)` | NOT NULL, `server_default=func.now()` |
-| `updated_at` | `DateTime(timezone=True)` | NOT NULL, `server_default=func.now()`, `onupdate=func.now()` |
-
-**`notifications`**
-
-| Columna | Tipo ORM | Restricciones |
-| --- | --- | --- |
-| `id` | `UUID` | PK, `default=uuid.uuid4` |
-| `client_id` | `UUID` | FK `clients.id`, `ON DELETE RESTRICT`, NOT NULL, index |
-| `channel` | enum dominio → VARCHAR | NOT NULL |
-| `recipient` | `String(320)` | NOT NULL (sin validar email/teléfono) |
-| `template` | `String(128)` | NOT NULL (identificador, no un CMS) |
-| `payload` | `JSONB` | NOT NULL |
-| `status` | enum dominio → VARCHAR | NOT NULL, default `PENDING` |
-| `retry_count` | `int` | NOT NULL, default `0` |
-| `idempotency_key` | `String(128) \| None` | nullable; único **por cliente cuando está presente** (D14) |
-| `error_message` | `Text \| None` | nullable |
-| `created_at` / `updated_at` | `TIMESTAMPTZ` | igual que clients |
-| `sent_at` | `DateTime(timezone=True) \| None` | nullable |
-
-Relación ORM: `Client.notifications` / `Notification.client`. `back_populates`. No cascada de delete.
+| D1 | Idea de la fase | Las apps cliente se autentican con una **API key** en el header `X-API-Key`. En Postgres **solo** vive el hash. Un `Depends` carga el `Client`. Cero envío, cero cola. |
+| D2 | Hash | `hashlib.sha256(raw.encode("utf-8")).hexdigest()` (stdlib). 64 caracteres hex. Cabe en `hashed_api_key` `String(255)` **sin** migración. |
+| D3 | Por qué no bcrypt / Argon2 | Esos algoritmos usan **sal distinta cada vez**. No puedes hacer `SELECT … WHERE hashed_api_key = hash(header)`. Tendrías que recorrer todos los clientes. A esta escala (5–20) “funcionaría”, pero es el patrón equivocado para API keys. |
+| D4 | Por qué no HMAC(`SECRET_KEY`) | Si mañana rotas `SECRET_KEY`, **todas** las keys de cliente dejarían de coincidir. La API key ya tiene mucha entropía (`token_urlsafe(32)`): SHA-256 sin sal es suficiente. `SECRET_KEY` sigue existiendo para Settings; **no** entra en el hash. |
+| D5 | Formato de la key en claro | `generate_api_key()` → prefijo `ne_` + `secrets.token_urlsafe(32)`. Ejemplo: `ne_xY3…`. El prefijo es para que EsrgaN la reconozca en logs/docs; no es un estándar de la industria. |
+| D6 | Header | Exactamente `X-API-Key`. `APIKeyHeader(name="X-API-Key", auto_error=False)`. `auto_error=False` porque FastAPI, si falta la key, a menudo responde **403**; `AGENTS.md` exige **401**. |
+| D7 | 401 único | Falta el header, header vacío, key desconocida, **o** cliente `is_active=False` → siempre `401` con el **mismo** cuerpo. Así no filtramos “esta key existió pero la desactivamos”. |
+| D8 | Cuerpo de error (solo este 401) | `{"detail": "Invalid or missing API key", "code": "unauthorized"}` más header `WWW-Authenticate: ApiKey`. Los `422` de Pydantic **no** se reescriben en esta fase (el mapper global de dominio sigue prohibido). |
+| D9 | Excepción HTTP | `UnauthorizedError` en `app/api/errors.py` + handler en `create_app`. **No** es dominio: no va a `app/domain/exceptions.py`. **No** mapear `InvalidStatusTransition`. |
+| D10 | Superficie HTTP | `GET /api/v1/clients/me` → `200` `{"id": "<uuid>", "name": "<str>"}`. Es el **probe** de auth (no está en la tabla §5.1 porque esa tabla asume `/send`). `/health` **sigue público** (sin key). **No** hay `POST` de alta de clientes ni admin. |
+| D11 | Capas | `security.py` (core) hashea. `ClientRepository` (persistencia) busca por hash. `deps.py` (composition root) arma sesión + auth. El **router** solo habla schemas + `Depends`. El router **no** importa `app.models`. |
+| D12 | `get_db` | Sesión desde `request.app.state.session_factory`. `yield` + `close()` en `finally`. **Cero `commit`** aquí (`AGENTS.md` §6.4: el use case commitea; este path es de lectura). |
+| D13 | Repositorio | Solo `get_by_hashed_api_key`. **No** `NotificationRepository`. **No** `ClientService` (`/me` no es un caso de uso de negocio; es “quién eres”). |
+| D14 | Schema | `AuthenticatedClient` (`id`, `name`). **No** devolver `hashed_api_key`, `is_active` ni `rate_limit_per_minute` (el limiter es Fase 8). |
+| D15 | Settings / Alembic | **No** hay campo nuevo. **No** hay revisión Alembic. `REDIS_URL` sigue ausente. |
+| D16 | Libs | **Prohibido** instalar `passlib`, `bcrypt`, `argon2-cffi`, `python-jose`, `PyJWT`, `authlib`. Stdlib alcanza. |
+| D17 | Tests | Unitarios de hash **sin** Postgres. Integración HTTP contra Postgres **real** con filas **commiteadas** (el `db_session` con rollback de Fase 4 **no** es visible para `TestClient`: otro pool). Cero `time.sleep`. Cero SQLite. |
+| D18 | Logs | Fallo: `api_key_rejected` con `reason=missing` o `unknown_or_inactive`. Éxito: `client_authenticated` con `client_id`. **Nunca** loguear la key en claro, el header, ni el hash. |
+| D19 | Git | Rama `feat/phase-5-api-keys` desde `main` actualizado (`be14f38` / PR #5). Commits **solo si EsrgaN lo pide**. |
+| D20 | Docker / extras | Prohibidos. No Kafka, JWT, Prisma, Redis, Celery, `BackgroundTasks`. |
 
 ---
 
@@ -79,54 +50,49 @@ Relación ORM: `Client.notifications` / `Notification.client`. `back_populates`.
 
 Archivos reales, no memoria:
 
-1. [`docs/STATUS.md`](docs/STATUS.md) marca Fases 1–3 hechas. [`AGENTS.md`](AGENTS.md) §10.1 siguiente número libre = **4 Persistencia**. No saltar a `/send` (fase 6): sin tabla, el 202 no tendría `notification_id` durable.
-2. [`app/domain/enums.py`](app/domain/enums.py) y [`app/domain/state_machine.py`](app/domain/state_machine.py) ya cierran canales y transiciones. Si la columna `status` nace como `String` libre, un `UPDATE` podría guardar `SENT → PENDING` sin pasar por el dominio. El ORM reusa esos enums; **no** reimplementa la máquina (la máquina sigue siendo funciones puras).
-3. [`app/models/__init__.py`](app/models/__init__.py) está vacío. [`app/core/config.py`](app/core/config.py) dice a propósito que `DATABASE_URL` no existe todavía. Esta fase **abre** la conexión: ahora sí es obligatorio (playbook §3).
-4. [`app/api/routers/health.py`](app/api/routers/health.py) no hace I/O. Debe seguir así: un probe de “¿el proceso vive?” no debe fallar porque Postgres esté reiniciando.
-5. [`pyproject.toml`](pyproject.toml) no tiene SQLAlchemy. Hay que **añadir e instalar** deps; no asumir que ya están.
-6. Ejemplo de uso: insertas un cliente “checkout-app” y una notificación `PENDING` a `user@example.com`. Reinicias Uvicorn. La fila sigue ahí. Eso es persistencia. `/send` todavía no existe; lo harás a mano en un test, no con curl de producto.
+1. [`docs/STATUS.md`](docs/STATUS.md) marca Fases 1–4 hechas. [`AGENTS.md`](AGENTS.md) §10.1 siguiente número libre = **5 API keys**. No saltar a `/send` (fase 6): persistir `PENDING` sin saber **qué cliente** es sería una fila huérfana de identidad.
+2. [`app/models/client.py`](app/models/client.py) ya tiene `hashed_api_key` UNIQUE y `is_active`. Los tests de persistencia insertan `"dummy-hash-not-a-real-key-…"`. Eso **no** es autenticación: es un string dummy. Falta el puente HTTP → hash → fila.
+3. [`app/main.py`](app/main.py) solo monta health. No hay `app/api/deps.py` ni `app/core/security.py`. [`app/repositories/__init__.py`](app/repositories/__init__.py) es un docstring. Esta fase **estrena** el composition root y el primer repositorio.
+4. [`app/api/routers/health.py`](app/api/routers/health.py) no pide llave. Debe seguir así: un probe de “¿el proceso vive?” no debe exigir credenciales (los orquestadores no tienen tu API key).
+5. Ejemplo de uso: insertas un cliente “checkout-app”, guardas el hash de `ne_abc…`, y haces `curl -H 'X-API-Key: ne_abc…' http://127.0.0.1:8000/api/v1/clients/me`. Ves `{"id":"…","name":"checkout-app"}`. Sin header, `401`. Eso es auth de máquinas, no login de humanos.
 
 ---
 
 ## 2. Árbol al cerrar esta fase
 
 ```text
-pyproject.toml                          # EDITAR: sqlalchemy, alembic, psycopg[binary]
-.env.example                            # EDITAR: DATABASE_URL descomentada, placeholder
-alembic.ini                             # NUEVO (alembic init)
-alembic/
-  env.py                                # NUEVO + EDITAR URL/metadata
-  script.py.mako                        # NUEVO (lo genera alembic init)
-  versions/
-    <rev>_create_clients_and_notifications.py   # NUEVO
-app/core/config.py                      # EDITAR: database_url obligatorio
-app/core/db.py                          # NUEVO: engine + session_factory
-app/main.py                             # EDITAR: lifespan crea/dispose engine
-app/models/__init__.py                  # EDITAR: reexportar Base, Client, Notification
-app/models/base.py                      # NUEVO
-app/models/client.py                    # NUEVO
-app/models/notification.py              # NUEVO
-tests/conftest.py                       # EDITAR: DATABASE_URL de test antes de importar app
-tests/unit/test_config.py               # EDITAR: fail-fast DATABASE_URL + prefix
-tests/unit/test_logging.py              # EDITAR: setenv DATABASE_URL en los Settings() válidos
-tests/integration/test_persistence.py   # NUEVO
-tests/integration/conftest.py           # NUEVO: engine, alembic upgrade, session con rollback
-README.md                               # EDITAR: Postgres + alembic
-docs/STATUS.md                          # EDITAR en el último paso de implementación
+app/core/security.py                         # NUEVO: generate_api_key, hash_api_key
+app/core/config.py                           # no tocar (SECRET_KEY / DATABASE_URL ya obligatorios)
+app/repositories/__init__.py                 # EDITAR: reexportar ClientRepository
+app/repositories/client_repository.py        # NUEVO
+app/api/errors.py                            # NUEVO: UnauthorizedError
+app/api/deps.py                              # NUEVO: get_db, get_current_client
+app/schemas/client.py                        # NUEVO: AuthenticatedClient
+app/api/routers/clients.py                   # NUEVO: GET /api/v1/clients/me
+app/main.py                                  # EDITAR: handler 401 + include_router
+tests/unit/test_security.py                  # NUEVO
+tests/integration/test_client_repository.py  # NUEVO (rollback session, OK)
+tests/integration/test_auth.py               # NUEVO (filas commiteadas + TestClient)
+tests/integration/conftest.py                # EDITAR solo si hace falta un fixture de seed commiteado
+README.md                                    # EDITAR: curl con X-API-Key + cómo sembrar un cliente local
+docs/STATUS.md                               # EDITAR en el último paso de implementación
 ```
 
-**No crear:** `app/api/deps.py`, repositorios, `app/core/security.py`, routers de `/api/v1/`, `Dockerfile`, `docker-compose.yml`, nada en `app/domain/` (el dominio no cambia).
+**No crear:** `POST /send`, `NotificationRepository`, `ClientService`, `app/core/security.py` extra (pepper, rounds), routers `/api/v1/notifications/`, `Dockerfile`, `docker-compose.yml`, migración Alembic, nada en `app/domain/`.
 
-**No tocar:** máquina de estados, health payload, `SECRET_KEY` (sigue obligatorio).
+**No tocar:** máquina de estados, modelos/columnas, `GET /health` payload, `SECRET_KEY` / `DATABASE_URL` validators, `create_all`.
 
 ---
 
 ## 3. Git
 
+Fase 4 ya está en `origin/main` (PR #5, squash `be14f38`). Crear la rama de Fase 5 **desde `main`**, no desde la feature vieja:
+
 ```bash
 git checkout main
-git pull   # si aplica; HEAD esperado 9a57e86
-git checkout -b feat/phase-4-persistence
+git pull
+# HEAD esperado: be14f38  (mensaje … (#5))
+git checkout -b feat/phase-5-api-keys
 ```
 
 Antes de cerrar cada paso de código:
@@ -137,429 +103,569 @@ pytest -q
 ruff check app tests
 ```
 
-Los 27 tests de Fases 2–3 deben seguir verdes (más los nuevos de esta fase).
+Los 33 tests de Fases 2–4 deben seguir verdes (más los nuevos de esta fase).
 
 ---
 
 ## FASE 0 — Preparación
 
-- [ ] `pytest -q` → 27 passed (o más, todos verdes) **antes** de editar
+- [ ] `pytest -q` → 33 passed **antes** de editar
 - [ ] `ruff check app tests` limpio
-- [ ] `psql --version` muestra 14.x (Homebrew). No instalar Postgres 16.
-- [ ] Postgres acepta conexiones locales:
-
-```bash
-createdb notifications_engine 2>/dev/null || true
-createdb notifications_engine_test 2>/dev/null || true
-psql -d notifications_engine -c 'SELECT 1'
-psql -d notifications_engine_test -c 'SELECT 1'
-```
-
-Si `createdb` pide usuario, usar el de macOS (en esta máquina: peer/trust típico de Homebrew). Documentar la URL real en `.env` **local** (gitignored), no en el repo.
-
-- [ ] Rama `feat/phase-4-persistence` creada
-- [ ] Cero Docker, cero Compose
-- [ ] Enseñar a EsrgaN (ejemplo): `createdb` es “crea una base vacía con este nombre”. Todavía no hay tablas; Alembic las pondrá. Es como tener una carpeta vacía antes de crear archivos.
+- [ ] Postgres local sigue arriba (`psql -d notifications_engine_test -c 'SELECT 1'`)
+- [ ] Rama `feat/phase-5-api-keys` creada desde `main` (`be14f38` / PR #5)
+- [ ] Cero Docker, cero Compose, cero `uv pip install` de libs de auth
+- [ ] Enseñar a EsrgaN (ejemplo): una **API key** es una contraseña de **aplicación**, no de persona. Stripe te da `sk_live_…`; tú se la pones a tu backend. Aquí el header se llama `X-API-Key`. JWT sería un carnet temporal de un humano después de login — no aplica.
 
 ---
 
-## FASE 4 — Persistencia
+## FASE 5 — API keys
 
-### Paso 4.1 — Dependencias
+### Paso 5.1 — Hash y generación (stdlib)
 
-Editar [`pyproject.toml`](pyproject.toml). Añadir a `dependencies` (mismo estilo de pines que FastAPI):
+Crear [`app/core/security.py`](app/core/security.py). Responsabilidad única: generar la key en claro y hashearla. Quién lo llama: tests, el snippet del README, y `get_current_client`. Nadie más implementa SHA-256 por su cuenta.
 
-```toml
-"sqlalchemy>=2.0.36,<3",
-"alembic>=1.14,<2",
-"psycopg[binary]>=3.2,<4",
+```python
+"""API key generation and hashing.
+
+Raw keys never persist. SHA-256 is deterministic so we can look up a client
+with one indexed SELECT. Do not switch to bcrypt: unique salts cannot be queried.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import secrets
+
+_API_KEY_PREFIX = "ne_"
+_TOKEN_BYTES = 32
+
+
+def generate_api_key() -> str:
+    """Return a high-entropy key. Show it once; store only hash_api_key(raw)."""
+    return f"{_API_KEY_PREFIX}{secrets.token_urlsafe(_TOKEN_BYTES)}"
+
+
+def hash_api_key(raw_api_key: str) -> str:
+    """Return the hex SHA-256 of the raw key (64 chars). Never log raw_api_key."""
+    return hashlib.sha256(raw_api_key.encode("utf-8")).hexdigest()
 ```
 
-Instalar en el venv:
+Crear [`tests/unit/test_security.py`](tests/unit/test_security.py):
 
-```bash
-source .venv/bin/activate
-uv pip install -e ".[dev]"
+```python
+from app.core.security import generate_api_key, hash_api_key
+
+
+def test_generate_api_key_has_prefix_and_is_unique() -> None:
+    first = generate_api_key()
+    second = generate_api_key()
+    assert first.startswith("ne_")
+    assert second.startswith("ne_")
+    assert first != second
+
+
+def test_hash_api_key_is_deterministic() -> None:
+    raw = "ne_example-key"
+    assert hash_api_key(raw) == hash_api_key(raw)
+
+
+def test_hash_api_key_differs_for_different_inputs() -> None:
+    assert hash_api_key("ne_a") != hash_api_key("ne_A")
+
+
+def test_hash_api_key_is_not_the_raw_key() -> None:
+    raw = generate_api_key()
+    hashed = hash_api_key(raw)
+    assert hashed != raw
+    assert len(hashed) == 64
+    int(hashed, 16)  # raises if not hex
 ```
 
-No añadir `asyncpg`, `psycopg2`, `prisma`, `sqlmodel`.
-
-- **Patrón:** pin de dependencias de runtime (la app las necesita para hablar con Postgres).
-- **Por qué:** sin el driver, SQLAlchemy no abre sockets a Postgres. `psycopg[binary]` trae la lib compilada; no hace falta `brew install libpq` extra para el alumno.
-- **Alternativa descartada:** `psycopg2-binary` (driver viejo). SQLAlchemy 2 + Python 3.12 prefieren psycopg 3. El `.env.example` ya comentaba `postgresql+psycopg://`.
-- **Capa:** empaquetado (`pyproject.toml`), no dominio.
-
-Cero tests nuevos en este paso salvo que `pytest -q` siga en 27.
+- **Patrón:** one-way hash de credencial (no “encryption”: no se puede descifrar).
+- **Por qué en este servicio:** si alguien copia la tabla `clients`, ve `e3b0c4…`, no `ne_abc…`. Ejemplo: el dump de un backup no sirve para pegar el header.
+- **Alternativa descartada:** bcrypt (D3) y HMAC con `SECRET_KEY` (D4).
+- **Capa:** `app/core/`. El dominio no sabe qué es una key. El modelo no hashea.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-chore: add SQLAlchemy, Alembic, and psycopg
+feat: hash API keys with SHA-256 before they touch Postgres
 
-Persistence needs a 2.0 ORM, migration history, and a Postgres
-driver before any table or session code can run.
+Store only a deterministic digest so a leaked clients table
+does not reveal the header value apps send.
 ```
 
 ---
 
-### Paso 4.2 — `DATABASE_URL` fail-fast
+### Paso 5.2 — `ClientRepository`
 
-Editar [`app/core/config.py`](app/core/config.py):
-
-- Campo `database_url: SecretStr` obligatorio (`Field(min_length=1)`).
-- Validador: `get_secret_value()` debe empezar por `postgresql+psycopg://`. Si no, `ValueError` (Pydantic lo envuelve en `ValidationError`).
-- Actualizar el docstring del módulo: ya no digas que `DATABASE_URL` está ausente; `REDIS_URL` sigue ausente.
-- **No** default. **No** leer un hostname mágico.
-
-Editar [`.env.example`](.env.example): descomentar y dejar placeholder (sin password real):
-
-```text
-DATABASE_URL=postgresql+psycopg://USER@localhost:5432/notifications_engine
-```
-
-Quitar el comentario “Unused until later…” de esa línea. `REDIS_URL` sigue comentada.
-
-Editar [`tests/conftest.py`](tests/conftest.py): **antes** de `from app.main import create_app`, forzar la URL de **test** (no la de desarrollo):
+Crear [`app/repositories/client_repository.py`](app/repositories/client_repository.py). Responsabilidad única: buscar un cliente por hash. Quién lo llama: `get_current_client`. El router **no** lo llama.
 
 ```python
-os.environ["DATABASE_URL"] = os.environ.get(
-    "TEST_DATABASE_URL",
-    "postgresql+psycopg://localhost:5432/notifications_engine_test",
-)
-os.environ.setdefault("SECRET_KEY", "pytest-secret-key")
-os.environ.setdefault("ENVIRONMENT", "test")
+"""Data access for Client rows. Routers must not query Session themselves."""
+
+from __future__ import annotations
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.models.client import Client
+
+
+class ClientRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def get_by_hashed_api_key(self, hashed_api_key: str) -> Client | None:
+        """Return the client with this digest, or None if no row matches."""
+        return self._session.scalar(
+            select(Client).where(Client.hashed_api_key == hashed_api_key)
+        )
 ```
 
-Si el usuario sin password falla, `TEST_DATABASE_URL` permite `postgresql+psycopg://USER@localhost:5432/notifications_engine_test` sin tocar código.
+Editar [`app/repositories/__init__.py`](app/repositories/__init__.py):
 
-Editar [`tests/unit/test_config.py`](tests/unit/test_config.py):
+```python
+"""Persistence adapters: repository implementations."""
 
-- En **todo** `Settings()` que hoy solo pone `SECRET_KEY` y debe **pasar**, añadir `monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://localhost:5432/notifications_engine_test")`.
-- Tests nuevos:
-  1. Sin `DATABASE_URL` → `ValidationError` (borrar env + `_env_file=None`).
-  2. `DATABASE_URL=postgresql://localhost/db` (sin `+psycopg`) → `ValidationError`.
-  3. `SECRET_KEY` corto sigue fallando (regresión).
+from app.repositories.client_repository import ClientRepository
 
-Editar [`tests/unit/test_logging.py`](tests/unit/test_logging.py): mismo `setenv` de `DATABASE_URL` en los tres tests que construyen `Settings()`.
+__all__ = ["ClientRepository"]
+```
 
-`GET /health` debe seguir 200 (aún no hay engine; si este paso se mergea solo, Settings ya exige la URL y el TestClient del conftest la tiene).
+Crear [`tests/integration/test_client_repository.py`](tests/integration/test_client_repository.py) usando el `db_session` **con rollback** de Fase 4 (aquí no hay HTTP; la misma transacción ve el insert):
 
-- **Patrón:** fail-fast configuration (`pydantic-settings`).
-- **Por qué en este servicio:** un API que “arranca” sin saber dónde está Postgres aceptaría trabajo que no puede guardar. Ejemplo: olvidas `.env` → el proceso **muere al boot** con error claro, no a las 3 a.m. en el primer insert.
-- **Alternativa descartada:** default `postgresql+psycopg://localhost/...` (AGENTS.md lo prohíbe: socket oculto que solo funciona en una máquina).
-- **Capa:** `app/core/` (config). El dominio no sabe qué es una URL.
+```python
+from sqlalchemy.orm import Session
+
+from app.core.security import generate_api_key, hash_api_key
+from app.models import Client
+from app.repositories import ClientRepository
+
+
+def test_get_by_hashed_api_key_returns_row(db_session: Session) -> None:
+    raw = generate_api_key()
+    row = Client(name="checkout-app", hashed_api_key=hash_api_key(raw), is_active=True)
+    db_session.add(row)
+    db_session.flush()
+
+    found = ClientRepository(db_session).get_by_hashed_api_key(hash_api_key(raw))
+    assert found is not None
+    assert found.id == row.id
+    assert found.hashed_api_key != raw
+
+
+def test_get_by_hashed_api_key_returns_none_for_unknown(db_session: Session) -> None:
+    found = ClientRepository(db_session).get_by_hashed_api_key(hash_api_key("ne_nope"))
+    assert found is None
+```
+
+- **Patrón:** repository (la consulta vive en persistencia, no en el router).
+- **Por qué:** ejemplo: mañana el lookup añade `is_active` en SQL. Cambias **un** archivo, no tres endpoints.
+- **Alternativa descartada:** `session.execute` dentro de `deps.py`. Funciona hoy; rompe la regla “routers/deps no son el sitio de las queries” y duplica SQL cuando exista `/send`.
+- **Capa:** `app/repositories/`. Puede importar modelos. **No** puede importar FastAPI.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-feat: require DATABASE_URL before the app boots
+feat: look up clients by hashed API key
 
-Fail fast with a psycopg URL so a misconfigured process cannot
-pretend it can persist notifications.
+Keep the SELECT in a repository so auth Depends never owns SQL.
 ```
 
 ---
 
-### Paso 4.3 — Modelos Mapped
+### Paso 5.3 — Errors, `get_db`, `get_current_client`
 
-Crear [`app/models/base.py`](app/models/base.py):
+Crear [`app/api/errors.py`](app/api/errors.py):
 
 ```python
-from sqlalchemy.orm import DeclarativeBase
+"""HTTP-layer errors for the API composition root. Not domain exceptions."""
 
 
-class Base(DeclarativeBase):
-    """Declarative metadata root. Alembic uses Base.metadata."""
+class UnauthorizedError(Exception):
+    """Missing, invalid, or inactive API key. Handler always returns the same 401 body."""
 ```
 
-Crear [`app/models/client.py`](app/models/client.py) y [`app/models/notification.py`](app/models/notification.py) con **exactamente** las columnas de D10–D14 y la tabla de §0.
+Crear [`app/api/deps.py`](app/api/deps.py). Responsabilidad: composition root de FastAPI (sesión + cliente autenticado). Puede importar modelos y repositorios. Los **routers** no.
 
-Contrato mínimo de `Notification` (el agente completa imports y `Client` igual de explícito):
+```python
+"""FastAPI dependencies: DB session and current client from X-API-Key."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Generator
+from typing import Annotated
+
+from fastapi import Depends, Request
+from fastapi.security import APIKeyHeader
+from sqlalchemy.orm import Session
+
+from app.api.errors import UnauthorizedError
+from app.core.config import get_settings
+from app.core.security import hash_api_key
+from app.repositories.client_repository import ClientRepository
+from app.schemas.client import AuthenticatedClient
+
+logger = logging.getLogger("app.auth")
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def get_db(request: Request) -> Generator[Session, None, None]:
+    """Yield a short-lived session from the lifespan factory. Do not commit here."""
+    session = request.app.state.session_factory()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def get_current_client(
+    session: Annotated[Session, Depends(get_db)],
+    api_key: Annotated[str | None, Depends(api_key_header)],
+) -> AuthenticatedClient:
+    """Resolve X-API-Key to an active client. Never return the ORM model to routers."""
+    if not api_key:
+        logger.info("api_key_rejected", extra={"reason": "missing"})
+        raise UnauthorizedError()
+
+    client = ClientRepository(session).get_by_hashed_api_key(hash_api_key(api_key))
+    if client is None or not client.is_active:
+        logger.info("api_key_rejected", extra={"reason": "unknown_or_inactive"})
+        raise UnauthorizedError()
+
+    logger.info("client_authenticated", extra={"client_id": str(client.id)})
+    return AuthenticatedClient(id=client.id, name=client.name)
+```
+
+`get_settings` ya existe en `app.core.config`. **No** hace falta reenvolverlo salvo que un router lo inyecte: si lo exportas, reexporta el mismo callable (`from app.core.config import get_settings`). No dupliques el `lru_cache`.
+
+Crear [`app/schemas/client.py`](app/schemas/client.py) **en este paso** porque `deps.py` lo importa (si prefieres, 5.3 y 5.4 se pueden aterrizar en el mismo commit; no dejes `deps.py` importando un módulo que no existe):
+
+```python
+"""Pydantic v2 schemas for authenticated client responses."""
+
+from __future__ import annotations
+
+import uuid
+
+from pydantic import BaseModel, ConfigDict
+
+
+class AuthenticatedClient(BaseModel):
+    """What HTTP handlers may see after X-API-Key succeeds. No hash, no secrets."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+```
+
+Editar [`app/main.py`](app/main.py): registrar el handler **antes** de montar routers. Añadir imports `Request`, `JSONResponse`, `UnauthorizedError`. No montes todavía `/clients` si lo dejas para 5.4; **sí** registra el handler aquí para que el 401 exista en cuanto el Depends se use.
+
+```python
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from app.api.errors import UnauthorizedError
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    application = FastAPI(
+        title=settings.app_name,
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    application.add_middleware(RequestIdMiddleware)
+
+    @application.exception_handler(UnauthorizedError)
+    async def handle_unauthorized(
+        _request: Request, _exc: UnauthorizedError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing API key", "code": "unauthorized"},
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    application.include_router(health_router)
+    # include_router(clients) llega en el paso 5.4 si este commit se parte
+    return application
+```
+
+Si 5.3 y 5.4 van juntos (recomendado si EsrgaN pide un commit por paso “que compile”), monta el router en el mismo diff.
+
+Health y request-id siguen verdes: el handler nuevo no cambia `/health`.
+
+- **Patrón:** dependency injection (FastAPI `Depends`) + composition root.
+- **Por qué:** ejemplo: `/me` y más adelante `/send` piden el mismo `Depends(get_current_client)`. No copias el hash en cada endpoint.
+- **Alternativa descartada:** middleware que mete `request.state.client`. Un middleware corre para **todas** las rutas (incluido health) o necesita allowlists. `Depends` es opt-in por endpoint.
+- **Otra alternativa descartada:** `HTTPBearer` / JWT. `AGENTS.md` lo prohíbe; las apps no hacen login.
+- **Capa:** `app/api/deps.py` (HTTP). `get_db` no vive en `app/core/db.py` porque leer `request.app.state` es cosa de FastAPI.
+
+- **Commit (si EsrgaN autoriza):**
+
+```text
+feat: resolve X-API-Key through FastAPI Depends
+
+Authenticate machine clients at the composition root so routers
+never hash keys or open their own sessions.
+```
+
+---
+
+### Paso 5.4 — `GET /api/v1/clients/me`
+
+Crear [`app/api/routers/clients.py`](app/api/routers/clients.py). Responsabilidad única: exponer quién es el cliente autenticado. Thin router: parse (nada) → Depends → schema.
+
+```python
+"""Authenticated client probe. Product send routes arrive in a later phase."""
+
+from __future__ import annotations
+
+from typing import Annotated
+
+from fastapi import APIRouter, Depends
+
+from app.api.deps import get_current_client
+from app.schemas.client import AuthenticatedClient
+
+router = APIRouter(prefix="/api/v1/clients", tags=["clients"])
+
+
+@router.get("/me", response_model=AuthenticatedClient)
+def read_me(
+    current_client: Annotated[AuthenticatedClient, Depends(get_current_client)],
+) -> AuthenticatedClient:
+    """Return the active client bound to X-API-Key. 401 is handled in deps."""
+    return current_client
+```
+
+Editar [`app/main.py`](app/main.py): `include_router` del clients router junto a health.
+
+**Prohibido en el router:** `Session`, `select(Client)`, `hash_api_key`, `Client` ORM.
+
+- **Patrón:** thin controller. El 401 no se decide aquí.
+- **Por qué existe `/me` ahora:** sin esta ruta no hay forma honesta de probar 401/200 por HTTP hasta Fase 6. Ejemplo de curl en el README. No es un dashboard.
+- **Alternativa descartada:** una ruta `__auth_probe` solo en tests. Enseñaría peor (EsrgaN no puede curl-earlo) y escondería el contrato OpenAPI.
+- **Capa:** `app/api/routers/`. Prefijo `/api/v1/` obligatorio en producto. Health sigue sin versionar.
+
+- **Commit (si EsrgaN autoriza):**
+
+```text
+feat: add GET /api/v1/clients/me behind X-API-Key
+
+Give machine clients a versioned probe so auth is exercisable
+before the send use case exists.
+```
+
+---
+
+### Paso 5.5 — Tests HTTP (Postgres real, filas commiteadas)
+
+El `db_session` de [`tests/integration/conftest.py`](tests/integration/conftest.py) hace rollback. `TestClient` abre **otro** engine en el lifespan. Si insertas con rollback, `/me` no ve la fila.
+
+Añadir en [`tests/integration/conftest.py`](tests/integration/conftest.py) un fixture que **commitea** y borra al terminar (no sustituyas el de rollback: persistencia de Fase 4 lo necesita):
 
 ```python
 import uuid
-from datetime import datetime
-from typing import Any
+from collections.abc import Generator
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, func, text
-from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import delete
+from sqlalchemy.orm import Session
 
-from app.domain.enums import Channel, NotificationStatus
-from app.models.base import Base
+from app.core.db import create_session_factory
+from app.core.security import generate_api_key, hash_api_key
+from app.models import Client
 
 
-class Notification(Base):
-    __tablename__ = "notifications"
-    __table_args__ = (
-        Index(
-            "uq_notifications_client_idempotency",
-            "client_id",
-            "idempotency_key",
-            unique=True,
-            postgresql_where=text("idempotency_key IS NOT NULL"),
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    client_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("clients.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    channel: Mapped[Channel] = mapped_column(
-        Enum(Channel, values_callable=lambda members: [m.value for m in members], native_enum=False, length=16),
-        nullable=False,
-    )
-    status: Mapped[NotificationStatus] = mapped_column(
-        Enum(
-            NotificationStatus,
-            values_callable=lambda members: [m.value for m in members],
-            native_enum=False,
-            length=16,
-        ),
-        nullable=False,
-        default=NotificationStatus.PENDING,
-    )
-    # recipient, template, payload, retry_count, idempotency_key, error_message,
-    # created_at, updated_at, sent_at: seguir la tabla congelada
-    client: Mapped["Client"] = relationship(back_populates="notifications")
+@pytest.fixture
+def seeded_active_client(
+    persistence_engine: Engine,
+) -> Generator[tuple[uuid.UUID, str, str], None, None]:
+    """Commit one active client so TestClient (separate pool) can authenticate."""
+    raw = generate_api_key()
+    name = f"auth-test-{uuid.uuid4().hex[:8]}"
+    factory = create_session_factory(persistence_engine)
+    with factory() as session:
+        row = Client(name=name, hashed_api_key=hash_api_key(raw), is_active=True)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        client_id = row.id
+    yield client_id, raw, name
+    with factory() as session:
+        session.execute(delete(Client).where(Client.id == client_id))
+        session.commit()
 ```
 
-Usar `UUID(as_uuid=True)` de `sqlalchemy.dialects.postgresql` **o** `sqlalchemy.Uuid` 2.0; una sola forma en los dos modelos, no mezclar.
-
-Editar [`app/models/__init__.py`](app/models/__init__.py): importar `Base`, `Client`, `Notification` para que `Base.metadata` vea ambas tablas. `__all__` explícito. Quitar el docstring “Empty in phase 1”.
-
-**Prohibido en los modelos:** métodos `mark_sent()` / llamar a `transition()`. Eso es dominio + servicio, no ORM. El modelo es un documento de columnas.
-
-`app/domain/` no importa `app.models`.
-
-- **Patrón:** Active Record ligero / mapping ORM (unidad: una clase = una tabla). Capa **persistencia**.
-- **Por qué:** el worker y el API (más adelante) hablan Python (`notification.status is NotificationStatus.PENDING`), no strings mágicos `"pending"` vs `"PENDING"`.
-- **Alternativa descartada:** tipo `ENUM` nativo de Postgres. Añadir un valor nuevo exige `ALTER TYPE` y Alembic se pelea. VARCHAR + enum Python es suficiente a esta escala (miles/día).
-- **Otra alternativa descartada:** SQLite “mientras tanto”. JSON/UUID/índice parcial no se comportan igual.
-
-Tests en este paso: ninguno que necesite Postgres todavía (llegan en 4.6). `pytest -q` de lo existente sigue verde. `ruff` / imports OK.
-
-- **Commit (si EsrgaN autoriza):**
-
-```text
-feat: map clients and notifications with SQLAlchemy 2
-
-Give Postgres a schema that reuses domain Channel and
-NotificationStatus instead of free-form status strings.
-```
-
----
-
-### Paso 4.4 — Engine, session factory, lifespan
-
-Crear [`app/core/db.py`](app/core/db.py). Responsabilidad única: construir engine y `sessionmaker`. Quién lo llama: lifespan (y tests de persistencia). Nadie más crea `create_engine` por su cuenta.
+Crear [`tests/integration/test_auth.py`](tests/integration/test_auth.py) — **obligatorios**:
 
 ```python
-from sqlalchemy import Engine, create_engine
-from sqlalchemy.orm import Session, sessionmaker
+import uuid
+
+from fastapi.testclient import TestClient
+from sqlalchemy import Engine
+from sqlalchemy.orm import Session
+
+from app.core.db import create_session_factory
+from app.core.security import generate_api_key, hash_api_key
+from app.models import Client
+
+_UNAUTHORIZED = {
+    "detail": "Invalid or missing API key",
+    "code": "unauthorized",
+}
 
 
-def create_engine_from_url(database_url: str) -> Engine:
-    """Build a sync engine. pool_pre_ping survives a local Postgres restart."""
-    return create_engine(database_url, pool_pre_ping=True, echo=False)
+def test_me_without_header_returns_401(client: TestClient) -> None:
+    response = client.get("/api/v1/clients/me")
+    assert response.status_code == 401
+    assert response.json() == _UNAUTHORIZED
+    assert response.headers.get("www-authenticate") == "ApiKey"
 
 
-def create_session_factory(engine: Engine) -> sessionmaker[Session]:
-    """Return a factory of short-lived sessions. Callers close or use context managers."""
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+def test_health_still_ok_without_api_key(client: TestClient) -> None:
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_me_with_unknown_key_returns_401(client: TestClient) -> None:
+    response = client.get(
+        "/api/v1/clients/me",
+        headers={"X-API-Key": "ne_this-key-is-not-in-the-database"},
+    )
+    assert response.status_code == 401
+    assert response.json() == _UNAUTHORIZED
+
+
+def test_me_with_valid_key_returns_client(
+    client: TestClient,
+    seeded_active_client: tuple[uuid.UUID, str, str],
+) -> None:
+    client_id, raw, name = seeded_active_client
+    response = client.get("/api/v1/clients/me", headers={"X-API-Key": raw})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == str(client_id)
+    assert body["name"] == name
+    assert "hashed_api_key" not in body
+
+
+def test_me_with_inactive_client_returns_401(
+    client: TestClient,
+    persistence_engine: Engine,
+) -> None:
+    raw = generate_api_key()
+    factory = create_session_factory(persistence_engine)
+    with factory() as session:
+        row = Client(
+            name="inactive-app",
+            hashed_api_key=hash_api_key(raw),
+            is_active=False,
+        )
+        session.add(row)
+        session.commit()
+        client_id = row.id
+    try:
+        response = client.get("/api/v1/clients/me", headers={"X-API-Key": raw})
+        assert response.status_code == 401
+        assert response.json() == _UNAUTHORIZED
+    finally:
+        with factory() as session:
+            session.delete(session.get(Client, client_id))
+            session.commit()
 ```
 
-`autoflush=False` + commit explícito: más adelante el *use case* (servicio) hace commit a propósito, no un helper escondido (AGENTS.md §6.4). `expire_on_commit=False` evita lazy-load sorpresa al devolver el objeto después del commit en tests.
+El test inactivo puede extraerse a un fixture `seeded_inactive_client` si queda más limpio; no dejes el `Client` en la BD si el assert falla (`try/finally` o fixture).
 
-Editar [`app/main.py`](app/main.py) lifespan:
+**Prohibido:** `time.sleep`, Twilio, `create_all`, TestClient pegándole a `/send`, log assertions que exijan la key en claro.
 
-1. `configure_logging` como ahora.
-2. `engine = create_engine_from_url(settings.database_url.get_secret_value())`.
-3. `application.state.engine = engine`.
-4. `application.state.session_factory = create_session_factory(engine)`.
-5. `yield`.
-6. `engine.dispose()` y log `application_stopped`.
-
-Renombrar el parámetro `_application` a `application` (ahora sí se usa).
-
-**No** hacer `engine.connect()` ni `SELECT 1` al arrancar (D9). `create_engine` es perezoso: no habla con Postgres hasta el primer checkout del pool.
-
-**No** crear `get_db` en routers. Health no cambia.
-
-Tests: `test_health_returns_ok` y request-id siguen verdes. Lifespan ahora construye engine (sin conectar). Si la URL es válida en forma, no hace falta Postgres para `/health`.
-
-- **Patrón:** composition root (fábrica de la app posee el engine). Dependency injection a través de `app.state`, no `create_engine()` dentro de un endpoint.
-- **Por qué:** dos requests no deben abrir cada uno su propio pool. Ejemplo: 100 requests → un pool, muchas `Session` cortas.
-- **Alternativa descartada:** `AsyncSession` + `asyncpg`. El worker Celery (fase 9) es sync; dos stacks async/sync enseñan peor y no ganan nada a miles/día.
-- **Capa:** `app/core/` + `app/main.py`. Los modelos no crean el engine.
+- **Patrón:** test de integración HTTP + BD real.
+- **Por qué commit y no rollback:** ejemplo: dos cajas (pool del test vs pool de la app) no comparten la transacción abierta. Si no haces `commit`, el portero mira una mesa vacía.
+- **Alternativa descartada:** SQLite en memoria. El UNIQUE de `hashed_api_key` sí se parecería; el resto del proyecto no, y `AGENTS.md` lo prohíbe como camino feliz.
+- **Capa:** `tests/integration/`. No mockear `Client` ni el repositorio.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-feat: open a request-scoped Postgres session factory at startup
+test: reject missing and invalid API keys with 401
 
-Own the engine in the app lifespan so endpoints never construct
-their own connections.
+Prove X-API-Key lookup against local Postgres, including inactive
+clients, without opening the send path.
 ```
 
 ---
 
-### Paso 4.5 — Alembic
-
-Desde la raíz del repo, con venv activo y deps instaladas:
-
-```bash
-alembic init alembic
-```
-
-Eso crea `alembic.ini` y `alembic/`. **No** commitear una URL con password en `alembic.ini`. Dejar `sqlalchemy.url =` vacío o un placeholder; `env.py` lo pisa.
-
-Editar [`alembic/env.py`](alembic/env.py):
-
-- Importar `get_settings`, `Base`, y los modelos (`from app.models import Base, Client, Notification`) para registrar tablas en `metadata`.
-- `target_metadata = Base.metadata`.
-- `config.set_main_option("sqlalchemy.url", get_settings().database_url.get_secret_value())`.
-- Conservar `run_migrations_offline` / `run_migrations_online` que genera Alembic; no reescribir el archivo de cero si no hace falta.
-
-Alembic necesita `SECRET_KEY` + `DATABASE_URL` porque usa `Settings`. Documentar: tener `.env` copiado (dev apunta a `notifications_engine`, no a `_test`).
-
-Generar la revisión:
-
-```bash
-alembic revision --autogenerate -m "create clients and notifications"
-```
-
-**Revisar el archivo en `alembic/versions/` a mano.** Autogenerate es un borrador, no verdad:
-
-- Debe crear `clients` y `notifications`.
-- `payload` tipo JSONB / `postgresql.JSONB`.
-- FK `client_id` → `clients.id`.
-- Índice único parcial `uq_notifications_client_idempotency`. Si autogenerate **no** lo emitió, **añadirlo a mano** en `upgrade()` y el `drop_index` en `downgrade()`.
-- Cero `ENUM` nativo de Postgres.
-- `downgrade()` hace drop de índices y tablas (notifications primero, luego clients).
-
-Aplicar en **dev**:
-
-```bash
-alembic upgrade head
-```
-
-Comprobar:
-
-```bash
-psql -d notifications_engine -c '\dt'
-psql -d notifications_engine -c '\d notifications'
-```
-
-Debe haber exactamente esas dos tablas de producto (más `alembic_version`).
-
-- **Patrón:** migraciones versionadas (historia del esquema).
-- **Por qué:** ejemplo: en el portátil de EsrgaN y más adelante en Compose, `alembic upgrade head` deja el mismo esquema. `create_all` no guarda el “cómo llegamos aquí” y se desvía entre máquinas.
-- **Alternativa descartada:** `Base.metadata.create_all(engine)` en el lifespan. AGENTS.md lo trata como defecto, no como atajo de desarrollo.
-- **Capa:** `alembic/` (infra). Los modelos declaran el destino; Alembic es el camino.
-
-No hace falta un test que parsee el archivo de revisión. El paso 4.6 **ejecuta** `upgrade` contra la BD de test: si la migración está mal, el insert falla.
-
-- **Commit (si EsrgaN autoriza):**
-
-```text
-feat: add Alembic migration for clients and notifications
-
-Schema changes go through revision history so local Postgres
-cannot drift from a silent create_all.
-```
-
----
-
-### Paso 4.6 — Tests de persistencia (Postgres real)
-
-Crear [`tests/integration/conftest.py`](tests/integration/conftest.py):
-
-1. Fixture **session-scoped** `persistence_engine`:
-   - URL = `os.environ["DATABASE_URL"]` (ya forzada al `_test` en el conftest raíz).
-   - Correr Alembic: `command.upgrade(alembic_cfg, "head")` con `script_location` apuntando al `alembic/` del repo.
-   - `yield engine`; al final `engine.dispose()`.
-2. Fixture **function-scoped** `db_session`:
-   - Abrir conexión, `connection.begin()`.
-   - `Session(bind=connection)`.
-   - `yield session`.
-   - rollback de la transacción + close. Así cada test deja la BD limpia **sin** `TRUNCATE` a mano y **sin** `sleep`.
-
-Si Postgres no está arriba, el test debe **fallar** con el error de conexión (mensaje claro). **No** `pytest.skip`. EsrgaN tiene que ver que esta fase exige Postgres local. **No** SQLite.
-
-Crear [`tests/integration/test_persistence.py`](tests/integration/test_persistence.py) — **obligatorios**:
-
-1. Insertar `Client` (name, `hashed_api_key="dummy-hash-not-a-real-key"`, `is_active=True`) + `Notification` (`channel=Channel.EMAIL`, `recipient="user@example.com"`, `template="welcome"`, `payload={"x": 1}`, `status` default). `flush` o `commit` según el fixture. Reloading: `status is NotificationStatus.PENDING`, `payload["x"] == 1`, `channel is Channel.EMAIL`.
-2. Dos notificaciones del **mismo** cliente con `idempotency_key=None` → ambas se insertan (no IntegrityError).
-3. Dos notificaciones del mismo cliente con el **mismo** `idempotency_key="replay-1"` → la segunda lanza `IntegrityError`.
-4. `GET /health` sigue 200 `{"status":"ok"}` (regresión; no abre sesión).
-5. Un test de unidad de dominio existente sigue importable: no hace falta repetirlo; `pytest tests/unit/domain -q` en el checklist basta.
-
-**Prohibido:** `time.sleep`, Twilio, `TestClient` que inserte por `/send` (no existe), `create_all`.
-
-Helper local en el test file para armar un `Client` (no un `helpers.py` de proyecto).
-
-- **Patrón:** test de integración contra la BD real (el contrato que SQLite mentiría).
-- **Por qué:** el índice parcial es comportamiento de **Postgres**. Ejemplo: dos SMS sin key de idempotencia deben poder existir; dos con `key=abc` no.
-- **Alternativa descartada:** fakeredis-style fake de SQLAlchemy. No ejercita JSONB ni el índice.
-- **Capa:** `tests/integration/`. No mockear `Notification` ni la máquina de estados.
-
-- **Commit (si EsrgaN autoriza):**
-
-```text
-test: persist notifications against local Postgres
-
-Prove Alembic tables, JSONB payload, and the partial
-idempotency unique index without hitting the HTTP send path.
-```
-
----
-
-### Paso 4.7 — Docs de status + README
+### Paso 5.6 — Docs de status + README
 
 Editar [`docs/STATUS.md`](docs/STATUS.md) **solo al cerrar la implementación** (otro turno, o el final de este PLAN cuando el código exista):
 
-- Marcar Fase 4 hecha: modelos, Alembic, `DATABASE_URL`, dos tablas.
-- Decir qué **sigue**: Fase 5 = hash de API keys + `X-API-Key` Depends. Aún no `/send`.
-- Arranque local: `alembic upgrade head` + `DATABASE_URL` en `.env`.
-- “Qué no existe” sigue incluyendo send, Redis, Celery, Docker.
+- Marcar Fase 5 hecha: `security.py`, `deps.py`, `ClientRepository`, `GET /api/v1/clients/me`, 401.
+- Decir qué **sigue**: Fase 6 = `POST /send` persist `PENDING` + **puerto de cola** (no Celery real) + `202`.
+- “Qué no existe” sigue incluyendo send, Redis, Celery, Docker, mapper de dominio.
+- No marcar Fase 6 como hecha.
 
 Editar [`README.md`](README.md):
 
-- Prerequisites: Postgres 14 Homebrew además de Python 3.12 / `uv`.
-- Setup: `createdb` de las dos bases, copiar `.env`, rellenar `DATABASE_URL`, `alembic upgrade head`.
-- Una línea de status: “Phase 4: Postgres tables exist; still no `/send`”.
-- Docker sigue “fase posterior”.
+- Status: “Phase 5: `X-API-Key` works on `GET /api/v1/clients/me`; still no `/send`”.
+- Cómo sembrar **un** cliente local (REPL o `python -c`, no un `scripts/` nuevo):
 
-No copiar el DDL entero al README.
+```python
+from app.core.config import get_settings
+from app.core.db import create_engine_from_url, create_session_factory
+from app.core.security import generate_api_key, hash_api_key
+from app.models import Client
+
+raw = generate_api_key()
+print(raw)  # save this; it is shown once
+engine = create_engine_from_url(get_settings().database_url.get_secret_value())
+with create_session_factory(engine)() as session:
+    session.add(Client(name="local-dev", hashed_api_key=hash_api_key(raw), is_active=True))
+    session.commit()
+```
+
+- Curl:
+
+```bash
+curl -i -H "X-API-Key: PASTE_RAW_KEY" http://127.0.0.1:8000/api/v1/clients/me
+# 200 {"id":"...","name":"local-dev"}
+
+curl -i http://127.0.0.1:8000/api/v1/clients/me
+# 401 {"detail":"Invalid or missing API key","code":"unauthorized"}
+```
+
+- `/health` sigue sin header.
+- Docker sigue “fase posterior”.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-docs: record local Postgres and Alembic in project status
+docs: record API key auth in local runbook and status
 ```
 
 ---
 
 ## 4. Checklist de cierre
 
-- [ ] `pytest -q` verde (27 anteriores + config DATABASE_URL + persistencia)
+- [ ] `pytest -q` verde (33 anteriores + security + repository + auth HTTP)
 - [ ] `ruff check app tests` limpio
-- [ ] `app/domain/` sigue sin importar SQLAlchemy/FastAPI
-- [ ] Cero `create_all` en código de app o tests
-- [ ] `alembic upgrade head` aplicado en `notifications_engine` local
-- [ ] `GET /health` no consulta Postgres
-- [ ] Cero routers `/api/v1/`, cero Redis, cero Celery, cero Docker, cero hash/verify de API keys
-- [ ] 3–6 learning points en español **simple** para EsrgaN (qué es un ORM, qué es una migración, ejemplo FK RESTRICT, por qué VARCHAR y no ENUM de PG, por qué health no hace `SELECT 1`)
+- [ ] `app/domain/` sigue sin importar FastAPI/SQLAlchemy
+- [ ] Routers de producto no importan `app.models` ni `Session`
+- [ ] Cero `create_all`, cero migración nueva, cero `commit` en `get_db`
+- [ ] `GET /health` sigue 200 sin `X-API-Key`
+- [ ] Cero `POST /send`, cero Redis, cero Celery, cero JWT, cero Docker, cero `passlib`
+- [ ] 3–6 learning points en español **simple** para EsrgaN (qué es una API key vs JWT, por qué hash y no texto claro, por qué SHA-256 y no bcrypt, qué es `Depends`, por qué `/health` no pide llave, por qué el test de auth hace `commit`)
 - [ ] Commits hechos o mensajes esperando a EsrgaN
 
-**Prohibido al terminar:** `POST /send`, `X-API-Key`, Celery, Redis, `BackgroundTasks`, JWT, Compose.
+**Prohibido al terminar:** `POST /send`, Celery, Redis, `BackgroundTasks`, JWT, Compose, alta HTTP de clientes.
 
 ---
 
 ## 5. Qué sigue (no implementar)
 
-Siguiente `PLAN.md` (otra reescritura): **API keys** — hash de la key en reposo + FastAPI `Depends` que lee `X-API-Key` y carga el `Client`. Todavía no hay cola ni `POST /send`.
+Siguiente `PLAN.md` (otra reescritura): **Accept send** — persistir `PENDING` + **puerto de cola** (interfaz, no Celery) + `202 Accepted`. Auth de esta fase se reutiliza. Todavía no hay worker ni Mailtrap.
