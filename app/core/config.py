@@ -1,9 +1,8 @@
 """Application settings loaded from the environment.
 
-`secret_key` is required so a misconfigured process fails at boot instead of
-running with silent empty config. `DATABASE_URL` and `REDIS_URL` are intentionally
-absent: nothing in this phase opens Postgres or Redis, so requiring them would
-force fake connection strings we do not use yet.
+`secret_key` and `database_url` are required so a misconfigured process fails at
+boot instead of running with silent empty config. `REDIS_URL` is intentionally
+absent: nothing in this phase opens Redis.
 """
 
 from functools import lru_cache
@@ -12,9 +11,11 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_PSYCOPG_URL_PREFIX = "postgresql+psycopg://"
+
 
 class Settings(BaseSettings):
-    """Fail-fast settings: boot dies without a usable SECRET_KEY."""
+    """Fail-fast settings: boot dies without SECRET_KEY and a psycopg DATABASE_URL."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -26,6 +27,7 @@ class Settings(BaseSettings):
     environment: Literal["local", "test", "production"] = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     secret_key: SecretStr = Field(min_length=16)
+    database_url: SecretStr = Field(min_length=1)
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -33,6 +35,18 @@ class Settings(BaseSettings):
         """Accept lowercase env values and normalize to the Literal uppercase set."""
         if isinstance(value, str):
             return value.upper()
+        return value
+
+    @field_validator("database_url")
+    @classmethod
+    def require_psycopg_url(cls, value: SecretStr) -> SecretStr:
+        """Reject SQLite and bare postgresql:// so the driver matches the locked stack."""
+        raw = value.get_secret_value()
+        if not raw.startswith(_PSYCOPG_URL_PREFIX):
+            raise ValueError(
+                "DATABASE_URL must start with 'postgresql+psycopg://' "
+                "(psycopg v3 driver required)"
+            )
         return value
 
 

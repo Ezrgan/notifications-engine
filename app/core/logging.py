@@ -100,5 +100,8 @@ def configure_logging(settings: Settings) -> None:
     root.addHandler(handler)
     setattr(root, _CONFIGURED_MARKER, True)
 
+    # Alembic's fileConfig can leave named loggers disabled; re-enable ours.
+    logging.getLogger("app").disabled = False
+
     # Keep noisy libraries quieter than our app logger by default.
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
