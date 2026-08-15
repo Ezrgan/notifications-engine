@@ -14,6 +14,8 @@ from app.api.routers.health import router as health_router
 from app.core.config import get_settings
 from app.core.db import create_engine_from_url, create_session_factory
 from app.core.logging import configure_logging
+from app.domain.exceptions import NotificationNotFound
+from app.services.queue import QueueUnavailableError
 
 
 @asynccontextmanager
@@ -51,6 +53,24 @@ def create_app() -> FastAPI:
             status_code=401,
             content={"detail": "Invalid or missing API key", "code": "unauthorized"},
             headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    @application.exception_handler(NotificationNotFound)
+    async def handle_notification_not_found(
+        _request: Request, _exc: NotificationNotFound
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "Notification not found", "code": "not_found"},
+        )
+
+    @application.exception_handler(QueueUnavailableError)
+    async def handle_queue_unavailable(
+        _request: Request, _exc: QueueUnavailableError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Queue unavailable", "code": "service_unavailable"},
         )
 
     application.include_router(health_router)
