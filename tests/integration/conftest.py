@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from alembic import command
 from app.core.db import create_engine_from_url, create_session_factory
 from app.core.security import generate_api_key, hash_api_key
-from app.models import Client
+from app.models import Client, Notification
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -66,5 +66,6 @@ def seeded_active_client(
         client_id = row.id
     yield client_id, raw, name
     with factory() as session:
+        session.execute(delete(Notification).where(Notification.client_id == client_id))
         session.execute(delete(Client).where(Client.id == client_id))
         session.commit()
