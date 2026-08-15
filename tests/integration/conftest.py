@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import os
+import uuid
 from collections.abc import Generator
 from pathlib import Path
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import Engine
+from sqlalchemy import Engine, delete
 from sqlalchemy.orm import Session
 
 from alembic import command
-from app.core.db import create_engine_from_url
+from app.core.db import create_engine_from_url, create_session_factory
+from app.core.security import generate_api_key, hash_api_key
+from app.models import Client
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -45,3 +48,23 @@ def db_session(persistence_engine: Engine) -> Generator[Session, None, None]:
         if transaction.is_active:
             transaction.rollback()
         connection.close()
+
+
+@pytest.fixture
+def seeded_active_client(
+    persistence_engine: Engine,
+) -> Generator[tuple[uuid.UUID, str, str], None, None]:
+    """Commit one active client so TestClient (separate pool) can authenticate."""
+    raw = generate_api_key()
+    name = f"auth-test-{uuid.uuid4().hex[:8]}"
+    factory = create_session_factory(persistence_engine)
+    with factory() as session:
+        row = Client(name=name, hashed_api_key=hash_api_key(raw), is_active=True)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        client_id = row.id
+    yield client_id, raw, name
+    with factory() as session:
+        session.execute(delete(Client).where(Client.id == client_id))
+        session.commit()

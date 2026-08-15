@@ -4,9 +4,12 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
+from app.api.errors import UnauthorizedError
 from app.api.middleware.request_id import RequestIdMiddleware
+from app.api.routers.clients import router as clients_router
 from app.api.routers.health import router as health_router
 from app.core.config import get_settings
 from app.core.db import create_engine_from_url, create_session_factory
@@ -39,7 +42,19 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     application.add_middleware(RequestIdMiddleware)
+
+    @application.exception_handler(UnauthorizedError)
+    async def handle_unauthorized(
+        _request: Request, _exc: UnauthorizedError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing API key", "code": "unauthorized"},
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
     application.include_router(health_router)
+    application.include_router(clients_router)
     return application
 
 
