@@ -11,11 +11,12 @@ from app.api.errors import UnauthorizedError
 from app.api.middleware.request_id import RequestIdMiddleware
 from app.api.routers.clients import router as clients_router
 from app.api.routers.health import router as health_router
+from app.api.routers.notifications import router as notifications_router
 from app.core.config import get_settings
 from app.core.db import create_engine_from_url, create_session_factory
 from app.core.logging import configure_logging
 from app.domain.exceptions import NotificationNotFound
-from app.services.queue import QueueUnavailableError
+from app.services.queue import InMemoryNotificationQueue, QueueUnavailableError
 
 
 @asynccontextmanager
@@ -28,6 +29,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     engine = create_engine_from_url(settings.database_url.get_secret_value())
     application.state.engine = engine
     application.state.session_factory = create_session_factory(engine)
+    application.state.notification_queue = InMemoryNotificationQueue()
 
     logger.info("application_started", extra={"environment": settings.environment})
     yield
@@ -75,6 +77,7 @@ def create_app() -> FastAPI:
 
     application.include_router(health_router)
     application.include_router(clients_router)
+    application.include_router(notifications_router)
     return application
 
 
