@@ -6,7 +6,11 @@ import os
 from collections.abc import Generator
 
 # Must run BEFORE importing app.main: create_app() executes at import time and
-# Settings() fails without SECRET_KEY (phase 2 fail-fast).
+# Settings() fails without SECRET_KEY / DATABASE_URL (fail-fast).
+os.environ["DATABASE_URL"] = os.environ.get(
+    "TEST_DATABASE_URL",
+    "postgresql+psycopg://localhost:5432/notifications_engine_test",
+)
 os.environ.setdefault("SECRET_KEY", "pytest-secret-key")
 os.environ.setdefault("ENVIRONMENT", "test")
 

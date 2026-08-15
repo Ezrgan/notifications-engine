@@ -5,15 +5,16 @@ requests, the API persists and enqueues them, workers dispatch across channels
 (email, SMS, push, webhook), and Redis Token Bucket rate limiting protects the
 HTTP path. **Day-to-day development is a local Python 3.12 venv** — not Docker.
 
-> **Phase 3 status:** domain states exist; still no `/send`. `GET /health`,
-> fail-fast `SECRET_KEY`, and structured logging with `X-Request-ID`. Product
-> routes (`/api/v1/...`), Postgres, Redis, and Celery arrive in later
-> `PLAN.md` rewrites.
+> **Phase 4 status:** Postgres tables exist (`clients`, `notifications`); still
+> no `/send`. `GET /health`, fail-fast `SECRET_KEY` + `DATABASE_URL`, domain
+> status machine, SQLAlchemy 2 Mapped models, and Alembic. Product routes
+> (`/api/v1/...`), Redis, and Celery arrive in later `PLAN.md` rewrites.
 
 ## Target architecture
 
-Today the HTTP path is health + request-id correlation. The diagram below is the
-**target** shape once later phases land:
+Today the HTTP path is health + request-id correlation, with a real Postgres
+schema ready for later `/send`. The diagram below is the **target** shape once
+later phases land:
 
 ```mermaid
 flowchart LR
@@ -32,8 +33,9 @@ flowchart LR
 
 - Python **3.12**
 - [`uv`](https://github.com/astral-sh/uv) (venv + package install)
+- PostgreSQL **14.x** via Homebrew (`psql --version` should show 14.x)
 
-Postgres and Redis are **later phases**. Do not install them for this slice.
+Redis is a **later phase**. Docker Compose is the **last** phase.
 
 ## Setup
 
@@ -44,14 +46,31 @@ uv pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-`SECRET_KEY` is **required** (≥16 characters). Without it the process fails at
-boot (`ValidationError`) instead of starting with empty config. Edit `.env` after
-copying `.env.example`.
+Create the two local databases (never mix app and test):
+
+```bash
+createdb notifications_engine
+createdb notifications_engine_test
+```
+
+Edit `.env`:
+
+- `SECRET_KEY` ≥ 16 characters (required).
+- `DATABASE_URL=postgresql+psycopg://USER@localhost:5432/notifications_engine`
+  (replace `USER`; add password if your Homebrew Postgres requires one).
+
+Apply migrations (creates `clients` and `notifications`):
+
+```bash
+alembic upgrade head
+```
+
+Without `SECRET_KEY` or a `postgresql+psycopg://` `DATABASE_URL`, the process
+fails at boot (`ValidationError`) instead of starting with empty config.
 
 ## Run
 
 ```bash
-cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -67,7 +86,11 @@ curl -i -H 'X-Request-ID: demo-1' http://127.0.0.1:8000/health
 
 ## Tests
 
+Persistence tests need the test database and a reachable Postgres:
+
 ```bash
+# Optional override if the default URL needs a user/password:
+# export TEST_DATABASE_URL=postgresql+psycopg://USER@localhost:5432/notifications_engine_test
 pytest
 ```
 
