@@ -33,7 +33,7 @@ Lista larga de `AGENTS.md` §10.1 (brújula, **no** tareas):
 | 11 | README curl | runbook local | Compose |
 | 12 | Docker | un `compose up` | no reescribir la app |
 
-La siguiente fase es **el primer número de esa tabla que STATUS marque como no hecho**. Hoy, al escribir este playbook, eso es la **3** (dominio). Cuando 3 cierre, la siguiente receta es la **4**. No saltes a 6 “porque es más visible”.
+La siguiente fase es **el primer número de esa tabla que `docs/STATUS.md` marque como no hecho**. No dejes un número congelado en este párrafo (se queda viejo). No saltes fases “porque se ve más”.
 
 ## 2. Forma obligatoria del PLAN.md (copiar estructura)
 

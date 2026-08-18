@@ -5,7 +5,7 @@ alwaysApply: false
 ---
 # Persistence
 
-Stack: PostgreSQL 16, SQLAlchemy 2.0 `Mapped[]`, Alembic only. Not Prisma, not Flyway SQL (`V001__...`), not `create_all` as the migration story.
+Stack: PostgreSQL **14+** (local Homebrew is 14.x; Compose later must not surprise-pull 16). SQLAlchemy 2.0 `Mapped[]`, Alembic only. Not Prisma, not Flyway SQL (`V001__...`), not `create_all` as the migration story.
 
 - Public IDs: **UUID**. Do not add a parallel `BIGSERIAL` + `public_id` unless EsrgaN asks.
 - Timestamps: `TIMESTAMPTZ` / timezone-aware datetimes, not naive `TIMESTAMP`.

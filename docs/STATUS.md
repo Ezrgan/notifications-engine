@@ -1,8 +1,6 @@
 # STATUS.md — foto técnica (qué hay / qué no)
 
-Última actualización: **Fase 6 cerrada en código**; [`PLAN.md`](../PLAN.md) sigue siendo **Fase 6** hasta que EsrgaN pida reescribirlo.  
-HEAD local: `feat/phase-6-accept-send`.  
-`origin/main` = `4fe08cc` (PR **#6**, squash de Fase 5). Esta rama añade Fase 6 encima.  
+Última actualización: **Fases 1–6 hechas en código.** [`PLAN.md`](../PLAN.md) sigue describiendo la Fase 6 hasta que EsrgaN pida reescribirlo a la 7.  
 `pytest -q` → **66 passed**. `ruff check app tests` limpio.
 
 ## Escala (no olvidar)
@@ -69,7 +67,7 @@ pytest -q
 - Envío = cola (Celery), no `BackgroundTasks`, no envío en el request. Hoy el puerto es in-memory.
 - Rate limit = Token Bucket en Redis, no dict en memoria.
 - Health sin versionar; producto bajo `/api/v1/`.
-- Postgres Homebrew 14 en local; Compose al final. (La rule `postgresql.mdc` cita 16; **gana `AGENTS.md`**: 14.x.)
+- Postgres Homebrew 14 en local; Compose al final.
 - `PLAN.md` = una fase; se reemplaza, no se concatena.
 - Transiciones: `PENDING → PROCESSING → SENT|FAILED`, y `PROCESSING → PENDING` (reintento). `SENT` y `FAILED` son terminales. `PENDING → SENT` es ilegal.
 - Enums en BD = VARCHAR (`native_enum=False`), no `ENUM` nativo de Postgres.

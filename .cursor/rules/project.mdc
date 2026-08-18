@@ -13,5 +13,5 @@ alwaysApply: true
 - v1 auth is `X-API-Key`, not JWT/OAuth. v1 dispatch is Celery, not FastAPI `BackgroundTasks`.
 - Implement **only** the current `PLAN.md`. When rewriting it, follow `docs/HOW_TO_WRITE_THE_NEXT_PLAN.md`. Do not pull later features from memory or from `AGENTS.md` §10.1.
 - Teach in **simple Spanish with examples**. No unexplained jargon.
-- Local-first: venv + Homebrew Postgres. Redis and Docker Compose are future PLAN rewrites, not this file.
+- Local-first: venv + Homebrew Postgres. Redis and Docker Compose are future PLAN rewrites, not this file. Next phase = first item in `AGENTS.md` §10.1 that `docs/STATUS.md` still lists as missing.
 - Do not add Kafka, K8s, Prisma, Supabase, or a frontend unless EsrgaN expands the charter.
