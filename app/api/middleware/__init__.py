@@ -1,1 +1,1 @@
-"""HTTP middleware package. Rate limiting arrives in a later phase."""
+"""HTTP middleware: request id and POST /send Token Bucket."""
