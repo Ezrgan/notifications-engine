@@ -11,6 +11,7 @@ from app.api.errors import UnauthorizedError
 from app.api.middleware.request_id import RequestIdMiddleware
 from app.api.routers.clients import router as clients_router
 from app.api.routers.health import router as health_router
+from app.api.routers.metrics import router as metrics_router
 from app.api.routers.notifications import router as notifications_router
 from app.core.config import get_settings
 from app.core.db import create_engine_from_url, create_session_factory
@@ -78,7 +79,9 @@ def create_app() -> FastAPI:
     application.include_router(health_router)
     application.include_router(clients_router)
     application.include_router(notifications_router)
+    application.include_router(metrics_router)
     return application
+
 
 
 app = create_app()
