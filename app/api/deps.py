@@ -13,7 +13,10 @@ from sqlalchemy.orm import Session
 from app.api.errors import UnauthorizedError
 from app.core.security import hash_api_key
 from app.repositories.client_repository import ClientRepository
+from app.repositories.notification_repository import NotificationRepository
 from app.schemas.client import AuthenticatedClient
+from app.services.notification_service import NotificationService
+from app.services.queue import NotificationQueue
 
 logger = logging.getLogger("app.auth")
 
@@ -45,3 +48,21 @@ def get_current_client(
 
     logger.info("client_authenticated", extra={"client_id": str(client.id)})
     return AuthenticatedClient(id=client.id, name=client.name)
+
+
+def get_notification_queue(request: Request) -> NotificationQueue:
+    """Return the queue adapter owned by lifespan (app.state)."""
+    queue: NotificationQueue = request.app.state.notification_queue
+    return queue
+
+
+def get_notification_service(
+    session: Annotated[Session, Depends(get_db)],
+    queue: Annotated[NotificationQueue, Depends(get_notification_queue)],
+) -> NotificationService:
+    """Compose the send/status use case for one request."""
+    return NotificationService(
+        session=session,
+        repository=NotificationRepository(session),
+        queue=queue,
+    )

@@ -1,0 +1,67 @@
+"""Data access for Notification rows. Routers must not query Session themselves."""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.domain.enums import Channel, NotificationStatus
+from app.models.notification import Notification
+
+
+class NotificationRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def create(
+        self,
+        *,
+        client_id: uuid.UUID,
+        channel: Channel,
+        recipient: str,
+        template: str,
+        payload: dict[str, Any],
+        idempotency_key: str | None,
+    ) -> Notification:
+        """Add a PENDING row with a client-side UUID. Caller commits."""
+        row = Notification(
+            id=uuid.uuid4(),
+            client_id=client_id,
+            channel=channel,
+            recipient=recipient,
+            template=template,
+            payload=payload,
+            status=NotificationStatus.PENDING,
+            idempotency_key=idempotency_key,
+        )
+        self._session.add(row)
+        return row
+
+    def get_by_id_for_client(
+        self,
+        notification_id: uuid.UUID,
+        client_id: uuid.UUID,
+    ) -> Notification | None:
+        """Return the row only if it belongs to ``client_id``."""
+        return self._session.scalar(
+            select(Notification).where(
+                Notification.id == notification_id,
+                Notification.client_id == client_id,
+            )
+        )
+
+    def get_by_idempotency_key(
+        self,
+        client_id: uuid.UUID,
+        idempotency_key: str,
+    ) -> Notification | None:
+        """Return the existing row for this client+key, or None."""
+        return self._session.scalar(
+            select(Notification).where(
+                Notification.client_id == client_id,
+                Notification.idempotency_key == idempotency_key,
+            )
+        )
