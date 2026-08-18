@@ -5,15 +5,16 @@ requests, the API persists and enqueues them, workers dispatch across channels
 (email, SMS, push, webhook), and Redis Token Bucket rate limiting protects the
 HTTP path. **Day-to-day development is a local Python 3.12 venv** — not Docker.
 
-> **Phase 5 status:** `X-API-Key` works on `GET /api/v1/clients/me`; still no
-> `/send`. Postgres tables, fail-fast settings, domain status machine, and
-> Alembic remain. Redis and Celery arrive in later `PLAN.md` rewrites.
+> **Phase 6 status:** `POST /api/v1/notifications/send` returns 202 and persists
+> PENDING; in-memory queue port; still no Celery/Redis. `X-API-Key` remains
+> required on product routes. Redis and Celery arrive in later `PLAN.md` rewrites.
 
 ## Target architecture
 
-Today the HTTP path is health + request-id + API key auth (`/api/v1/clients/me`),
-with a real Postgres schema ready for later `/send`. The diagram below is the
-**target** shape once later phases land:
+Today the HTTP path is health + request-id + API key auth, plus accept-send:
+persist `PENDING`, enqueue the id on an in-memory port, return `202`. Nobody
+sends email yet — the in-memory queue does not dispatch. The diagram below is
+the **target** shape once later phases land:
 
 ```mermaid
 flowchart LR
@@ -108,9 +109,22 @@ curl -i -H "X-API-Key: PASTE_RAW_KEY" http://127.0.0.1:8000/api/v1/clients/me
 
 curl -i http://127.0.0.1:8000/api/v1/clients/me
 # 401 {"detail":"Invalid or missing API key","code":"unauthorized"}
+
+curl -i -H "X-API-Key: PASTE_RAW_KEY" -H "Content-Type: application/json" \
+  -d '{"channel":"email","recipient":"user@example.com","template":"welcome","payload":{"name":"Ada"},"idempotency_key":"welcome-1"}' \
+  http://127.0.0.1:8000/api/v1/notifications/send
+# 202 {"notification_id":"...","status":"PENDING"}
+
+curl -i -H "X-API-Key: PASTE_RAW_KEY" \
+  http://127.0.0.1:8000/api/v1/notifications/NOTIFICATION_ID/status
+# 200 {"notification_id":"...","status":"PENDING"}
 ```
 
 `/health` stays public (no `X-API-Key`). Product routes under `/api/v1/` require it.
+
+**No email goes out.** `202` means the row is stored as `PENDING` and the id was
+handed to an in-memory list. There is no worker yet; restarting the process
+forgets the list, but the Postgres row remains.
 
 ## Tests
 

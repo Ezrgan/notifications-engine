@@ -1,10 +1,9 @@
 # STATUS.md — foto técnica (qué hay / qué no)
 
-Última actualización: **Fase 5 cerrada en código** (`feat/phase-5-api-keys`).  
-Base: `origin/main` = `be14f38` (PR **#5**).  
-`pytest -q` debe incluir los 33 de Fases 2–4 más security + repository + auth HTTP. `ruff check app tests` limpio.
-
-El [`PLAN.md`](../PLAN.md) actual sigue describiendo la Fase 5 (no reescribir todavía a Fase 6 hasta que EsrgaN lo pida).
+Última actualización: **Fase 6 cerrada en código**; [`PLAN.md`](../PLAN.md) sigue siendo **Fase 6** hasta que EsrgaN pida reescribirlo.  
+HEAD local: `feat/phase-6-accept-send`.  
+`origin/main` = `4fe08cc` (PR **#6**, squash de Fase 5). Esta rama añade Fase 6 encima.  
+`pytest -q` → **66 passed**. `ruff check app tests` limpio.
 
 ## Escala (no olvidar)
 
@@ -17,28 +16,32 @@ Desarrollo **local-first**: `uv` venv. Docker Compose es la **última** fase, un
 | Pieza | Dónde | Comportamiento |
 | --- | --- | --- |
 | Paquete + venv | `pyproject.toml`, `.venv/` | Python 3.12, FastAPI, SQLAlchemy 2, Alembic, psycopg, pytest, ruff. Sin Celery/Redis libs. |
-| App factory | `app/main.py` | `create_app()`, lifespan: logs + engine/session_factory, handler 401, routers health + clients. |
+| App factory | `app/main.py` | `create_app()`, lifespan: logs + engine/session_factory + cola in-memory, handlers 401/404/503, routers health + clients + notifications. |
 | Health | `GET /health` | 200 `{"status":"ok"}`. Sin prefijo `/api/v1`. **Sin** API key. Sin I/O a Postgres. |
 | Auth | `X-API-Key` | `app/core/security.py` (SHA-256), `ClientRepository`, `app/api/deps.py`, `GET /api/v1/clients/me` → 200 `{id,name}` o 401 uniforme. |
+| Accept send | `POST /api/v1/notifications/send` | Auth → validar body → persistir `PENDING` → `commit` → `enqueue(id)` → **202** `{notification_id, status}`. Replay de `idempotency_key` → misma fila, sin segundo enqueue. |
+| Status | `GET /api/v1/notifications/{id}/status` | 200 `{notification_id, status}` si es del cliente. Missing o de otro cliente → **mismo** 404 `not_found`. |
+| Cola (puerto) | `app/services/queue.py` | Protocol `NotificationQueue` + `InMemoryNotificationQueue` (lista en RAM, `app.state`). **No** Celery. |
+| Servicio | `app/services/notification_service.py` | Caso de uso accept + get_status. Aquí está el `commit`. |
 | Settings | `app/core/config.py` | Obliga `SECRET_KEY` (≥16) y `DATABASE_URL` (`SecretStr`, prefijo `postgresql+psycopg://`). **No** hay `REDIS_URL` todavía. |
 | DB helpers | `app/core/db.py` | Engine sync + `sessionmaker` (`pool_pre_ping`, `autoflush=False`). |
 | Modelos | `app/models/` | `Client`, `Notification` (Mapped). Enums de dominio como VARCHAR. Índice único parcial de idempotencia. |
-| Repositorio | `app/repositories/client_repository.py` | `get_by_hashed_api_key` solamente. |
-| Migraciones | `alembic/` | Revisión que crea `clients` + `notifications`. URL desde Settings. Cero `create_all`. Sin revisión nueva en Fase 5. |
-| Logs | `app/core/logging.py` | stdlib. Texto en local/test, JSON en production. Auth: `api_key_rejected` / `client_authenticated` (nunca la key en claro). |
+| Repositorios | `app/repositories/` | `ClientRepository` + `NotificationRepository` (create, get by id+client, get by idempotency). |
+| Migraciones | `alembic/` | Revisión `a1b2c3d4e5f6` crea `clients` + `notifications`. URL desde Settings. Cero `create_all`. Sin revisión nueva en Fase 6. |
+| Logs | `app/core/logging.py` | stdlib. Texto en local/test, JSON en production. Send: `notification_accepted` / `notification_idempotent_replay` / `notification_status_read` (nunca payload ni recipient entero). |
 | Request id | `app/api/middleware/request_id.py` | Header `X-Request-ID` in/out + `ContextVar`. |
-| Dominio | `app/domain/` | `Channel`, `NotificationStatus`, máquina de transiciones. Stdlib only (no importa SQLAlchemy). |
-| Tests | `tests/` | Unit (config, logging, dominio, security) + integración API/auth + persistencia (Postgres real + Alembic). |
+| Dominio | `app/domain/` | `Channel`, `NotificationStatus`, máquina de transiciones, `NotificationNotFound`. Stdlib only (no importa SQLAlchemy). |
+| Tests | `tests/` | Unit (config, logging, dominio, security, queue, schemas, service fakes) + integración API/auth/send + persistencia (Postgres real + Alembic). |
 | Postgres en la máquina | Homebrew | `psql (PostgreSQL) 14.19`. Bases: `notifications_engine` (app) y `notifications_engine_test` (tests). |
 
 ## Qué no existe (no lo inventes)
 
-- `POST /api/v1/notifications/send`, status, métricas
-- `NotificationRepository`, `ClientService`, alta HTTP de clientes
+- `GET /metrics`
+- `ClientService`, alta HTTP de clientes
 - Redis, Token Bucket, 429
 - Celery, providers, DLQ
 - Dockerfile / Compose
-- Mapper HTTP de excepciones de dominio (`InvalidStatusTransition` etc.)
+- Mapper HTTP de `InvalidStatusTransition` (esta fase no transiciona)
 - JWT / OAuth / `passlib` / bcrypt
 
 ## Arranque local (hoy)
@@ -53,6 +56,9 @@ alembic upgrade head
 uvicorn app.main:app --reload --port 8000
 curl -i http://127.0.0.1:8000/health
 curl -i -H "X-API-Key: PASTE_RAW_KEY" http://127.0.0.1:8000/api/v1/clients/me
+curl -i -H "X-API-Key: PASTE_RAW_KEY" -H "Content-Type: application/json" \
+  -d '{"channel":"email","recipient":"user@example.com","template":"welcome"}' \
+  http://127.0.0.1:8000/api/v1/notifications/send
 pytest -q
 ```
 
@@ -60,7 +66,7 @@ pytest -q
 
 - Idioma: enseñar en español simple; código/commits en inglés.
 - Auth de clientes = API Key, no JWT. Hash = SHA-256 determinista (no bcrypt).
-- Envío = cola (Celery), no `BackgroundTasks`, no envío en el request.
+- Envío = cola (Celery), no `BackgroundTasks`, no envío en el request. Hoy el puerto es in-memory.
 - Rate limit = Token Bucket en Redis, no dict en memoria.
 - Health sin versionar; producto bajo `/api/v1/`.
 - Postgres Homebrew 14 en local; Compose al final. (La rule `postgresql.mdc` cita 16; **gana `AGENTS.md`**: 14.x.)
@@ -69,6 +75,7 @@ pytest -q
 - Enums en BD = VARCHAR (`native_enum=False`), no `ENUM` nativo de Postgres.
 - Schema solo vía Alembic (nunca `create_all` en app/tests).
 - 401 de auth: mismo cuerpo si falta key, es desconocida o el cliente está inactivo.
+- Accept send: `commit` primero, luego `enqueue`. Replay de idempotencia → 202 con la fila original, sin segundo enqueue. 404 idéntico para missing y foreign.
 
 ## Capas (quién importa a quién)
 
@@ -85,4 +92,6 @@ FastAPI no envía la notificación. El worker no expone HTTP. Routers no importa
 
 ## Qué sigue
 
-Después de cerrar Fase 5 (este código), la siguiente reescritura de `PLAN.md` es **Accept send**: persistir `PENDING` + **puerto de cola** (interfaz, no Celery real) + `202 Accepted`. Auth de esta fase se reutiliza. Todavía no hay worker ni Mailtrap.
+Siguiente `PLAN.md` (otra reescritura, **no** este turno): **Fase 7 Metrics** — conteos de envíos OK vs fallo por cliente autenticado. Todavía no hay Redis ni Celery: los conteos salen de Postgres (`SENT`/`FAILED`). Hoy casi todo será `PENDING`; el endpoint y la query igual se construyen.
+
+No marcar Fase 7 como hecha.
