@@ -1,6 +1,6 @@
 # STATUS.md — foto técnica (qué hay / qué no)
 
-Última actualización: **Fases 1–8 hechas en código** (rama `feat/phase-8-token-bucket`). `main` sigue en `7a2b828` (sin metrics ni cubo). [`PLAN.md`](../PLAN.md) describe la **Fase 8**; la implementación **ya está**.  
+Última actualización: **Fases 1–8 hechas en código** (rama `feat/phase-8-token-bucket`). `main` = `0cb1a13` (Fase 7 fusionada, PR **#8**). [`PLAN.md`](../PLAN.md) describe la **Fase 8**; la implementación **ya está**.  
 `pytest -q` → **90 passed**. `ruff check app tests` limpio.  
 Siguiente fase = **9 Celery worker en el mismo venv + provider simulado**. Redis ya existe; el broker usará **otro índice** (`/1`), no un segundo servidor.
 
