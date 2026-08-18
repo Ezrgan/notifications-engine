@@ -1,9 +1,9 @@
-# PLAN.md — Fase 6: Accept send (`PENDING` + puerto de cola + `202`)
+# PLAN.md — Fase 7: Metrics (conteos `sent` / `failed` por cliente)
 
 > **REGLA OBLIGATORIA PARA TODOS LOS AGENTES:**
-> Antes de ejecutar cualquier paso, leer y acatar [`AGENTS.md`](./AGENTS.md), [`.cursor/rules/`](./.cursor/rules/) (sobre todo `fastapi.mdc`, `postgresql.mdc`, `testing.mdc` y `celery.mdc`) y [`docs/HOW_TO_WRITE_THE_NEXT_PLAN.md`](./docs/HOW_TO_WRITE_THE_NEXT_PLAN.md).
+> Antes de ejecutar cualquier paso, leer y acatar [`AGENTS.md`](./AGENTS.md), [`.cursor/rules/`](./.cursor/rules/) (sobre todo `fastapi.mdc`, `postgresql.mdc` y `testing.mdc`) y [`docs/HOW_TO_WRITE_THE_NEXT_PLAN.md`](./docs/HOW_TO_WRITE_THE_NEXT_PLAN.md).
 > Este archivo es el **único plan ejecutable**. Describe **una sola fase**. Cuando cierre, EsrgaN **reescribe** `PLAN.md` entero (ver el playbook en `docs/`).
-> No implementar Celery real, Redis, Token Bucket, métricas, mapper de `InvalidStatusTransition`, JWT, Mailtrap/Twilio ni Docker.
+> No implementar Redis, Token Bucket, 429, Celery, providers, DLQ, Prometheus/Grafana, JWT, alta HTTP de clientes ni Docker.
 
 > **Cómo está pensado este documento:**
 > Un agente debe poder implementarlo **sin inventar**. Cada paso: archivos exactos, contrato, tests, commit propuesto, qué no tocar.
@@ -11,11 +11,11 @@
 > Enseñar a EsrgaN en **español simple**, con ejemplos. Sin jerga sin definir.
 
 > **Estado de partida (verificado):**
-> Rama actual `feat/phase-5-api-keys` = `f6a5058` (`feat: authenticate machine clients with X-API-Key`).
-> `origin/main` = `be14f38` — squash del PR **#5** (Fase 4). **Fase 5 aún no está en `main`.**
-> `pytest -q` → **44 passed**. `ruff check app tests` limpio.
-> Hay `X-API-Key`, `ClientRepository`, `GET /api/v1/clients/me`, tablas `clients` / `notifications` (Alembic `a1b2c3d4e5f6`), índice único parcial `(client_id, idempotency_key)`.
-> **No** existe `POST /send`, `NotificationRepository`, `NotificationService`, puerto de cola, Celery, Redis, ni `GET /metrics`. `app/services/__init__.py` y `app/workers/__init__.py` son solo docstrings.
+> Rama actual `main` = `7a2b828` (`docs: stop freezing the next-phase number in the playbook`).
+> `origin/main` = el mismo commit. Fase 6 ya está fusionada (`9923ddb` = PR **#7**).
+> `pytest -q` → **66 passed**. `ruff check app tests` limpio.
+> Hay `POST /api/v1/notifications/send` → 202 + `PENDING`, `GET …/status`, `NotificationService`, `NotificationRepository`, cola in-memory, `X-API-Key`.
+> **No** existe `GET /metrics`, `MetricsService`, query `COUNT`, Redis, Celery, ni worker que ponga filas en `SENT`/`FAILED`. `REDIS_URL` sigue comentado en `.env.example`. `pyproject.toml` no lista `celery` ni `redis`.
 
 ---
 
@@ -23,26 +23,25 @@
 
 | # | Decisión | Valor congelado |
 | --- | --- | --- |
-| D1 | Idea de la fase | El cliente autenticado **acepta** un envío: validar body → persistir `PENDING` → `enqueue(notification_id)` en un **puerto** → **`202 Accepted`**. Nadie llama a un provider. Nadie arranca Celery. |
-| D2 | Por qué un puerto y no Celery ahora | Un **puerto** es una interfaz que *nosotros* definimos (`enqueue(id)`). Un **adaptador** es la implementación (hoy: lista en RAM; Fase 9: Celery). Ejemplo: el servicio dice “pon este UUID en la cola”; no sabe si detrás hay Redis o un array de pytest. Si importáramos Celery hoy, el HTTP path se casaría con el broker antes de tener worker. |
-| D3 | Adaptador de esta fase | `InMemoryNotificationQueue`: guarda UUIDs en una `list`. Vive en `app.state` (lifespan). Se pierde al reiniciar el proceso. **Eso es correcto:** las filas `PENDING` quedan en Postgres; el worker (Fase 9) será quien las despache. |
-| D4 | Orden persistir vs encolar | **`commit` primero, luego `enqueue`.** Ejemplo: si el proceso muere después del `202`, la fila ya existe y se puede consultar. Si `enqueue` falla, HTTP **503** y la fila sigue `PENDING` (hueco conocido: no hay *transactional outbox*; no lo construyas). |
-| D5 | Replay de idempotencia | Misma `client_id` + misma `idempotency_key` → devolver la fila **original** con **202** (no 409, no 200). **No** volver a `enqueue`. Ejemplo: el checkout reintenta el POST porque no vio la respuesta; no queremos dos SMS. |
-| D6 | Carrera (dos POSTs a la vez) | El índice único `uq_notifications_client_idempotency` es la red de seguridad. Si `commit` lanza `IntegrityError`, `rollback`, buscar la fila ganadora, devolverla, **no** encolar. Si el error no es de idempotencia (no hay key / no hay fila), **re-lanzar**. |
-| D7 | `idempotency_key` | Campo **opcional del body** (no header). `str` 1–128 o `null`/omitido. Dos POST **sin** key = dos filas (aunque el body sea igual). Key vacía `""` → **422**. |
-| D8 | HTTP send | `POST /api/v1/notifications/send` + `X-API-Key`. **202** `{"notification_id": "<uuid>", "status": "PENDING"}`. Auth rota → **401** idéntico a `/me`. Body inválido → **422** de Pydantic (no reescribir el schema de error 422). |
-| D9 | HTTP status (misma fase) | `GET /api/v1/notifications/{notification_id}/status`. Respuesta `{"notification_id": "...", "status": "PENDING\|PROCESSING\|SENT\|FAILED"}`. Sin fila **o** fila de otro cliente → **404** con el **mismo** cuerpo (no filtrar “existe pero no es tuya”). No está en §10.1 como fase aparte; es la lectura del mismo agregado. **No** es métricas. |
-| D10 | 404 / 503 | `NotificationNotFound` (dominio) → `{"detail": "Notification not found", "code": "not_found"}`. `QueueUnavailableError` vive **junto al puerto** (`app/services/queue.py`), no en `app/api/errors.py`: el servicio no puede importar la capa HTTP. Handler → `{"detail": "Queue unavailable", "code": "service_unavailable"}`. **No** mapear `InvalidStatusTransition` (esta fase no transiciona; inserta `PENDING` de entrada). |
-| D11 | Validación del body | `channel`: `email` / `sms` / `push` / `webhook` (valores del `StrEnum`, minúsculas). `recipient`: 1–320 chars, **sin** regex de email ni E.164. `template`: 1–128. `payload`: objeto JSON, default `{}`. `extra="forbid"`. `"EMAIL"` (mayúsculas) → 422. |
-| D12 | Capas | Router → schemas + `Depends` + `NotificationService`. Servicio → repositorio + puerto de cola + `session.commit()`. Repositorio → SQLAlchemy. Router **no** importa `app.models` ni `Session`. Dominio **no** importa FastAPI/SQLAlchemy/Pydantic. |
-| D13 | `get_db` | Sigue **sin** `commit` (Fase 5). El use case commitea. `expire_on_commit=False` ya está en `create_session_factory`: tras `commit` puedes leer `notification.id`. |
-| D14 | UUID | El servicio (o el `create` del repo) asigna `id=uuid.uuid4()` **antes** del commit para poder encolar el mismo id. No esperes a que Postgres lo genere. |
-| D15 | Settings / Alembic / libs | **Cero** campo nuevo. **Cero** revisión Alembic (la tabla ya existe). **Cero** `celery`, `redis`, `kombu` en `pyproject.toml`. `REDIS_URL` sigue comentado en `.env.example`. |
-| D16 | Fuera de esta fase | Celery worker, provider simulado, retries/DLQ, Token Bucket/429, `GET /metrics`, alta HTTP de clientes, `BackgroundTasks`, JWT, Docker, outbox table. |
-| D17 | Tests | Unitarios: puerto in-memory, schemas, servicio con **fakes** (sin Postgres). Integración: repo con `db_session` (rollback); HTTP con filas **commiteadas** + `TestClient` (otro pool, igual que auth). Cero `time.sleep`. Cero SQLite. Cero Twilio. |
-| D18 | Logs | `notification_accepted` / `notification_idempotent_replay` / `notification_status_read` con `notification_id`, `client_id`, `channel`, `status`. **Nunca** payload completo, recipient entero, ni API key. |
-| D19 | Git | Rama `feat/phase-6-accept-send` **desde** `feat/phase-5-api-keys` (`f6a5058`), **no** desde `main` (`be14f38` no tiene auth). Si EsrgaN fusiona Fase 5 a `main` antes, entonces sí partir de ese `main` nuevo. Commits **solo si EsrgaN lo pide**. |
-| D20 | Docker / extras | Prohibidos. No Kafka, JWT, Prisma, Redis, Celery, Compose. |
+| D1 | Idea de la fase | El cliente autenticado lee **cuántos envíos suyos ya terminaron bien vs mal**. `GET /api/v1/metrics` → **200** `{"sent": N, "failed": M}`. Nadie envía un email. Nadie arranca Prometheus. |
+| D2 | Qué cuentan `sent` y `failed` | `sent` = filas con `status = SENT`. `failed` = filas con `status = FAILED`. Ejemplo: el checkout hace 10 `POST /send`; las 10 están `PENDING`; metrics devuelve `{"sent":0,"failed":0}`. Eso **es correcto**: aceptar trabajo no es haberlo entregado. |
+| D3 | Qué **no** cuentan | `PENDING` y `PROCESSING` **no** entran en ningún campo. No añadas `pending`, `processing`, `total`, `queued` ni desglose por canal. El contrato de `AGENTS.md` §5.1 es “success vs failure”, no un dashboard. |
+| D4 | Fuente de verdad | **Postgres**, query `COUNT` filtrada por `client_id`. No hay tabla nueva. No hay contador en Redis (Redis no existe; además se desfasaría de las filas). No hay proceso que incremente un entero en RAM. |
+| D5 | Query (una ida a la BD) | Un `SELECT` con `count(*) FILTER (WHERE status = 'SENT')` y el mismo para `FAILED`, `WHERE client_id = :id`. **Sin** `GROUP BY` (un cliente sin filas seguiría devolviendo una fila `(0, 0)`; un `GROUP BY` vacío no). **Prohibido** `select(Notification)` y sumar en Python. |
+| D6 | Vacío | Cero filas del cliente → **200** `{"sent":0,"failed":0}`. **Nunca** 404. 404 significaría “no existe el recurso metrics”; el recurso existe, los conteos son cero. |
+| D7 | Aislamiento | El `WHERE client_id` **es** la autorización. Las `SENT` de la app B no aparecen en el GET de la app A. No hay endpoint admin. No hay métricas globales. |
+| D8 | HTTP | `GET /api/v1/metrics` + `X-API-Key`. **200** con el schema de D1. Auth rota → **401** idéntico a `/me` y `/send` (`{"detail":"Invalid or missing API key","code":"unauthorized"}` + `WWW-Authenticate: ApiKey`). Sin body. Sin query params. |
+| D9 | Capas | Router → schemas + `Depends` + `MetricsService`. Servicio → repositorio (solo lectura). Repositorio → SQLAlchemy `COUNT`. Router **no** importa `app.models` ni `Session`. `NotificationService` **no** gana un método `get_metrics` (ver D10). |
+| D10 | Servicio propio, no inflar el de send | `MetricsService` en `app/services/metrics_service.py`. Responsabilidad: caso de uso “leer conteos del cliente”. **No** recibe cola. **No** hace `commit`. `NotificationService` ya exige `queue` para accept; colgar metrics ahí obligaría a inyectar un puerto que este GET no usa. |
+| D11 | DTO del repositorio vs HTTP | El repo devuelve `ClientSendCounts` (`dataclass(frozen=True)` con `sent: int`, `failed: int`) **en el mismo archivo del repo**. El schema HTTP `ClientMetricsResponse` vive en `app/schemas/metrics.py`. El repositorio **no** importa Pydantic. El router **no** ve el dataclass. |
+| D12 | Cómo aparecen `SENT`/`FAILED` en tests | **Insertar filas** con ese `status` (sesión de test). No hay worker. **No** llames a la máquina de estados para “simular un envío”. **No** hagas `POST /send` y luego `UPDATE` en el test HTTP del camino feliz de metrics: el test de “POST no mueve metrics” es otro (D17). |
+| D13 | Settings / Alembic / libs | **Cero** campo nuevo (`REDIS_URL` sigue comentado). **Cero** revisión Alembic (`client_id` ya está indexado). **Cero** `prometheus-client`, `redis`, `celery`. Cero `CREATE INDEX` nuevo. |
+| D14 | Logs | Un `metrics_read` con `client_id`, `sent`, `failed`. **Nunca** API key, payload ni recipient. |
+| D15 | `get_db` | Sigue **sin** `commit`. Este caso de uso no escribe. |
+| D16 | Fuera de esta fase | Redis, Token Bucket, 429, Celery, provider simulado, retries/DLQ, mapper de `InvalidStatusTransition`, `ClientService`, JWT, Docker, Grafana, `/metrics` estilo Prometheus (texto `sent_total 3`). |
+| D17 | Tests | Unitarios: servicio con **fake** de repo (sin Postgres). Integración repo: `COUNT` con `db_session` (rollback). Integración HTTP: filas **commiteadas** + `TestClient` (otro pool, igual que `/send`). Obligatorio: 401; ceros; POST `/send` no incrementa `sent`; aislamiento entre clientes; `PENDING`/`PROCESSING` no cuentan. Cero `time.sleep`. Cero SQLite. Cero Twilio. |
+| D18 | Git | Rama `feat/phase-7-metrics` **desde** `main` (`7a2b828`). Fase 6 ya está en `main`; no partir de `feat/phase-6-accept-send`. Commits **solo si EsrgaN lo pide**. |
+| D19 | Docker / extras | Prohibidos. No Kafka, JWT, Prisma, Redis, Celery, Compose, Prometheus. |
 
 ---
 
@@ -50,56 +49,50 @@
 
 Archivos reales, no memoria:
 
-1. [`docs/STATUS.md`](docs/STATUS.md) marca Fases 1–5 hechas en código. [`AGENTS.md`](AGENTS.md) §10.1 siguiente número libre = **6 Accept send**. No saltar a métricas (7), Redis (8) ni Celery (9): encolar en un broker que nadie consume no enseña el contrato HTTP `202`.
-2. [`app/models/notification.py`](app/models/notification.py) ya tiene columnas, default `PENDING` e índice único parcial. [`tests/integration/test_persistence.py`](tests/integration/test_persistence.py) inserta filas a mano. Eso **no** es el caso de uso: falta el puente HTTP → servicio → repo → puerto.
-3. [`app/api/deps.py`](app/api/deps.py) ya resuelve `X-API-Key` a `AuthenticatedClient`. [`app/main.py`](app/main.py) solo monta health + `/clients/me`. [`app/services/__init__.py`](app/services/__init__.py) está vacío. [`pyproject.toml`](pyproject.toml) no lista Celery ni Redis.
-4. [`app/core/db.py`](app/core/db.py) ya tiene `expire_on_commit=False`. [`get_db`](app/api/deps.py) no commitea. El unique de idempotencia ya está en Alembic `a1b2c3d4e5f6`. Esta fase **no** toca migraciones.
-5. Ejemplo de uso: `curl -H 'X-API-Key: ne_…' -d '{"channel":"email","recipient":"a@b.com","template":"welcome"}' POST /api/v1/notifications/send` → `202` + UUID. Un `GET …/status` con esa key ve `PENDING`. Otra app con otra key y el mismo UUID ve `404`. El SMS **no** sale: solo se aceptó el trabajo.
+1. [`docs/STATUS.md`](docs/STATUS.md) marca Fases 1–6 hechas. [`AGENTS.md`](AGENTS.md) §10.1 siguiente número libre = **7 Metrics**. No saltar a Redis (8) ni Celery (9): un Token Bucket no enseña el contrato de “éxito vs fallo”, y sin worker igual necesitamos poder **leer** el agregado.
+2. [`app/api/routers/notifications.py`](app/api/routers/notifications.py) solo tiene `POST /send` y `GET /{id}/status`. [`app/main.py`](app/main.py) monta health + clients + notifications. **No** hay ruta `/metrics`.
+3. [`app/repositories/notification_repository.py`](app/repositories/notification_repository.py) sabe `create`, `get_by_id_for_client`, `get_by_idempotency_key`. **No** hay `COUNT`. [`app/services/notification_service.py`](app/services/notification_service.py) orquesta accept + status y **exige** `NotificationQueue`.
+4. [`app/models/notification.py`](app/models/notification.py) ya tiene `status` (`PENDING`/`PROCESSING`/`SENT`/`FAILED`) e índice en `client_id`. No hace falta migración: contar no cambia el esquema.
+5. Ejemplo de uso: `curl -H 'X-API-Key: ne_…' GET /api/v1/metrics` → `200 {"sent":0,"failed":0}` el día 1 (todo es `PENDING`). El día que el worker (Fase 9) marque 3 `SENT` y 1 `FAILED`, el mismo curl devuelve `{"sent":3,"failed":1}` **sin cambiar este endpoint**.
 
 ---
 
 ## 2. Árbol al cerrar esta fase
 
 ```text
-app/domain/exceptions.py                      # EDITAR: NotificationNotFound
-app/domain/__init__.py                        # EDITAR: reexportar NotificationNotFound
-app/services/queue.py                         # NUEVO: Protocol + InMemory + QueueUnavailableError
-app/services/notification_service.py          # NUEVO: accept + get_status
-app/services/__init__.py                      # EDITAR: reexportar servicio/puerto
-app/repositories/notification_repository.py   # NUEVO
-app/repositories/__init__.py                  # EDITAR: reexportar NotificationRepository
-app/schemas/notification.py                   # NUEVO: request + responses
-app/api/errors.py                             # no tocar (sigue solo UnauthorizedError)
-app/api/deps.py                               # EDITAR: get_notification_queue, get_notification_service
-app/api/routers/notifications.py              # NUEVO: POST /send + GET /{id}/status
-app/main.py                                   # EDITAR: lifespan queue, handlers 404/503, include_router
-tests/unit/test_queue.py                      # NUEVO
-tests/unit/schemas/test_notification.py       # NUEVO
-tests/unit/services/test_notification_service.py  # NUEVO (fakes, sin Postgres)
-tests/integration/test_notification_repository.py # NUEVO (rollback session)
-tests/integration/test_send.py                # NUEVO (filas commiteadas + TestClient)
-tests/integration/conftest.py                 # EDITAR: borrar notifications antes del client (FK RESTRICT)
-README.md                                     # EDITAR: curl send + status
+app/repositories/notification_repository.py   # EDITAR: ClientSendCounts + count_sent_and_failed_for_client
+app/repositories/__init__.py                  # no hace falta reexportar el dataclass
+app/schemas/metrics.py                        # NUEVO: ClientMetricsResponse
+app/services/metrics_service.py               # NUEVO: get_client_metrics
+app/services/__init__.py                      # EDITAR: reexportar MetricsService
+app/api/deps.py                               # EDITAR: get_metrics_service
+app/api/routers/metrics.py                    # NUEVO: GET /api/v1/metrics
+app/main.py                                   # EDITAR: include_router metrics
+tests/unit/services/test_metrics_service.py   # NUEVO (fake repo, sin Postgres)
+tests/integration/test_notification_repository.py  # EDITAR: tests del COUNT
+tests/integration/test_metrics.py             # NUEVO (filas commiteadas + TestClient)
+README.md                                     # EDITAR: curl metrics
 docs/STATUS.md                                # EDITAR en el último paso de implementación
 ```
 
-**No crear:** `celery_app.py`, `tasks.py`, `app/providers/*` reales, `Dockerfile`, `docker-compose.yml`, revisión Alembic, `GET /metrics`, Redis client, `BackgroundTasks`, outbox table, `ClientService`.
+**No crear:** `celery_app.py`, `tasks.py`, `app/providers/*` reales, `Dockerfile`, `docker-compose.yml`, revisión Alembic, cliente Redis, middleware Token Bucket, `BackgroundTasks`, tabla `metrics`, `prometheus-client`.
 
-**No tocar:** máquina de estados (no hay transiciones aquí), modelos/columnas, `GET /health`, `SECRET_KEY` / `DATABASE_URL`, `hash_api_key`, `create_all`, `pyproject.toml` dependencies.
+**No tocar:** máquina de estados, modelos/columnas, `GET /health`, `SECRET_KEY` / `DATABASE_URL`, `hash_api_key`, `create_all`, `pyproject.toml` dependencies, `NotificationService.accept` / `get_status`, puerto de cola, `app/api/errors.py`.
 
 ---
 
 ## 3. Git
 
-Fase 5 vive en `feat/phase-5-api-keys` (`f6a5058`), **no** en `origin/main`. Crear la rama de Fase 6 así:
+Fase 6 ya está en `main` (`7a2b828`). Crear la rama así:
 
 ```bash
-git checkout feat/phase-5-api-keys
-# HEAD esperado: f6a5058
-git checkout -b feat/phase-6-accept-send
+git checkout main
+# HEAD esperado: 7a2b828
+git pull   # si EsrgaN lo pide; origin/main ya estaba en 7a2b828 al escribir este PLAN
+git checkout -b feat/phase-7-metrics
 ```
 
-Si EsrgaN ya fusionó Fase 5 a `main`, partir de ese `main` actualizado. **Nunca** partir de `be14f38`.
+**Nunca** partir de `feat/phase-6-accept-send` ni commitear en `main`.
 
 Antes de cerrar cada paso de código:
 
@@ -109,105 +102,28 @@ pytest -q
 ruff check app tests
 ```
 
-Los 44 tests de Fases 2–5 deben seguir verdes (más los nuevos de esta fase).
+Los 66 tests de Fases 2–6 deben seguir verdes (más los nuevos de esta fase).
 
 ---
 
 ## FASE 0 — Preparación
 
-- [ ] `pytest -q` → 44 passed **antes** de editar
+- [ ] `pytest -q` → 66 passed **antes** de editar
 - [ ] `ruff check app tests` limpio
 - [ ] Postgres local sigue arriba (`psql -d notifications_engine_test -c 'SELECT 1'`)
-- [ ] Rama `feat/phase-6-accept-send` creada desde `feat/phase-5-api-keys` (`f6a5058`), no desde `main` antiguo
-- [ ] Cero Docker, cero `uv pip install celery` / `redis`
-- [ ] Enseñar a EsrgaN (ejemplo): **aceptar** no es **enviar**. Es como dejar un sobre en bandeja de salida: te dan un número de seguimiento (`notification_id`) y `202` (“lo tomé; aún no lo despaché”). Celery sería el cartero; llega en Fase 9.
+- [ ] Rama `feat/phase-7-metrics` creada desde `main` (`7a2b828`)
+- [ ] Cero Docker, cero `uv pip install redis` / `celery` / `prometheus-client`
+- [ ] Enseñar a EsrgaN (ejemplo): **métricas de producto** ≠ **métricas de servidor**. `GET /metrics` aquí es “de mis 100 SMS, 97 llegaron y 3 fallaron”. Prometheus sería “este proceso FastAPI va a 50 req/s”; eso no es el contrato de v1. Contar en Postgres es como preguntarle al archivo de la oficina cuántos paquetes salieron; un número en un papelito al lado de la puerta se pierde si cambia el turno.
 
 ---
 
-## FASE 6 — Accept send
+## FASE 7 — Metrics
 
-### Paso 6.1 — Puerto de cola (Protocol + in-memory)
+### Paso 7.1 — `COUNT` en el repositorio
 
-Crear [`app/services/queue.py`](app/services/queue.py). Responsabilidad única: definir *qué* significa encolar un id, y un adaptador de proceso para tests y local. Quién lo llama: `NotificationService` y el lifespan. El router **no** lo llama. **No** vive en `app/workers/` (el API no debe importar workers).
+Editar [`app/repositories/notification_repository.py`](app/repositories/notification_repository.py). Responsabilidad nueva: un agregado de lectura por cliente. Quién lo llama: `MetricsService`. El router **no** lo llama.
 
-```python
-"""Queue port for accepted notifications.
-
-The HTTP path enqueues an id; it never talks to Celery or a provider.
-InMemoryNotificationQueue is the v1 adapter until a later phase swaps Celery in.
-"""
-
-from __future__ import annotations
-
-import uuid
-from typing import Protocol
-
-
-class QueueUnavailableError(Exception):
-    """Raised when enqueue cannot complete. HTTP handler maps this to 503."""
-
-
-class NotificationQueue(Protocol):
-    """Application-owned port: accept a notification id for later dispatch."""
-
-    def enqueue(self, notification_id: uuid.UUID) -> None:
-        """Record ``notification_id``. Must not send the notification.
-
-        Adapters may raise ``QueueUnavailableError``.
-        """
-        ...
-
-
-class InMemoryNotificationQueue:
-    """Process-local list. Lost on restart; Postgres still holds PENDING rows."""
-
-    def __init__(self) -> None:
-        self.enqueued: list[uuid.UUID] = []
-
-    def enqueue(self, notification_id: uuid.UUID) -> None:
-        self.enqueued.append(notification_id)
-```
-
-Crear [`tests/unit/test_queue.py`](tests/unit/test_queue.py):
-
-```python
-import uuid
-
-from app.services.queue import InMemoryNotificationQueue
-
-
-def test_in_memory_queue_records_ids_in_order() -> None:
-    queue = InMemoryNotificationQueue()
-    first = uuid.uuid4()
-    second = uuid.uuid4()
-    queue.enqueue(first)
-    queue.enqueue(second)
-    assert queue.enqueued == [first, second]
-
-
-def test_in_memory_queue_starts_empty() -> None:
-    assert InMemoryNotificationQueue().enqueued == []
-```
-
-- **Patrón:** puerto / adaptador (hexagonal). El Protocol es el enchufe; InMemory es un ladrón de prueba.
-- **Por qué en este servicio:** ejemplo: mañana `CeleryNotificationQueue.enqueue` hace `deliver.delay(str(id))`. `NotificationService.accept` **no cambia**.
-- **Alternativa descartada:** `BackgroundTasks` de FastAPI. Si Uvicorn muere, la tarea se pierde y no hay fila-con-worker. `AGENTS.md` lo prohíbe para trabajo que debe sobrevivir.
-- **Capa:** `app/services/`. No es dominio (el dominio no sabe qué es una cola). No es `app/workers/` (aún no hay Celery).
-
-- **Commit (si EsrgaN autoriza):**
-
-```text
-feat: add an in-memory notification queue port
-
-Keep accept-send independent of Celery so the HTTP path
-enqueues ids behind a stable interface.
-```
-
----
-
-### Paso 6.2 — `NotificationRepository`
-
-Crear [`app/repositories/notification_repository.py`](app/repositories/notification_repository.py). Responsabilidad única: insertar y buscar notificaciones. Quién lo llama: `NotificationService`. El router **no** lo llama.
+Dejar `create` / `get_by_id_for_client` / `get_by_idempotency_key` **iguales**. Añadir el dataclass y el método. El archivo queda así (completo):
 
 ```python
 """Data access for Notification rows. Routers must not query Session themselves."""
@@ -215,13 +131,22 @@ Crear [`app/repositories/notification_repository.py`](app/repositories/notificat
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.domain.enums import Channel, NotificationStatus
 from app.models.notification import Notification
+
+
+@dataclass(frozen=True)
+class ClientSendCounts:
+    """Terminal send counts for one client. PENDING/PROCESSING are not included."""
+
+    sent: int
+    failed: int
 
 
 class NotificationRepository:
@@ -277,424 +202,157 @@ class NotificationRepository:
                 Notification.idempotency_key == idempotency_key,
             )
         )
+
+    def count_sent_and_failed_for_client(self, client_id: uuid.UUID) -> ClientSendCounts:
+        """Return SENT/FAILED counts for ``client_id`` without loading rows."""
+        stmt = select(
+            func.count().filter(Notification.status == NotificationStatus.SENT),
+            func.count().filter(Notification.status == NotificationStatus.FAILED),
+        ).where(Notification.client_id == client_id)
+        sent, failed = self._session.execute(stmt).one()
+        return ClientSendCounts(sent=int(sent or 0), failed=int(failed or 0))
 ```
 
-**Prohibido:** `get_by_id` sin `client_id` en esta fase (invitaría a filtrar existencia entre clientes). El worker (Fase 9) podrá añadir un lookup interno.
+**Prohibido:** un `get_all_for_client` que traiga la tabla a RAM. Un `count_by_status` genérico que invite a exponer `PENDING` en HTTP.
 
-Editar [`app/repositories/__init__.py`](app/repositories/__init__.py):
+Editar [`tests/integration/test_notification_repository.py`](tests/integration/test_notification_repository.py): **añadir** al final (no borres los tests de `create` / lookup). Imports nuevos: `Notification` desde `app.models`.
 
 ```python
-"""Persistence adapters: repository implementations."""
-
-from app.repositories.client_repository import ClientRepository
-from app.repositories.notification_repository import NotificationRepository
-
-__all__ = ["ClientRepository", "NotificationRepository"]
+from app.models import Client, Notification
 ```
 
-Crear [`tests/integration/test_notification_repository.py`](tests/integration/test_notification_repository.py) con el `db_session` de rollback (aquí no hay HTTP):
+Helper y tests nuevos (el `_client` que ya existe se reutiliza):
 
 ```python
-import uuid
-
-from sqlalchemy.orm import Session
-
-from app.domain.enums import Channel, NotificationStatus
-from app.models import Client
-from app.repositories import NotificationRepository
-
-
-def _client(session: Session) -> Client:
-    row = Client(
-        name="checkout-app",
-        hashed_api_key=f"dummy-hash-{uuid.uuid4().hex}",
-        is_active=True,
-    )
-    session.add(row)
-    session.flush()
-    return row
-
-
-def test_create_inserts_pending_row(db_session: Session) -> None:
-    client = _client(db_session)
-    repo = NotificationRepository(db_session)
-    row = repo.create(
-        client_id=client.id,
+def _row(
+    session: Session,
+    client_id: uuid.UUID,
+    status: NotificationStatus,
+) -> Notification:
+    row = Notification(
+        client_id=client_id,
         channel=Channel.EMAIL,
         recipient="user@example.com",
         template="welcome",
-        payload={"x": 1},
-        idempotency_key=None,
+        payload={},
+        status=status,
     )
+    session.add(row)
+    return row
+
+
+def test_count_sent_and_failed_ignores_pending_and_processing(db_session: Session) -> None:
+    client = _client(db_session)
+    repo = NotificationRepository(db_session)
+    _row(db_session, client.id, NotificationStatus.PENDING)
+    _row(db_session, client.id, NotificationStatus.PENDING)
+    _row(db_session, client.id, NotificationStatus.PROCESSING)
+    _row(db_session, client.id, NotificationStatus.SENT)
+    _row(db_session, client.id, NotificationStatus.SENT)
+    _row(db_session, client.id, NotificationStatus.SENT)
+    _row(db_session, client.id, NotificationStatus.FAILED)
     db_session.flush()
-    assert row.status is NotificationStatus.PENDING
-    assert row.payload["x"] == 1
-    assert row.id is not None
+
+    counts = repo.count_sent_and_failed_for_client(client.id)
+    assert counts.sent == 3
+    assert counts.failed == 1
 
 
-def test_get_by_id_for_client_hides_other_clients_row(db_session: Session) -> None:
+def test_count_sent_and_failed_is_zero_when_client_has_no_rows(db_session: Session) -> None:
+    client = _client(db_session)
+    repo = NotificationRepository(db_session)
+    counts = repo.count_sent_and_failed_for_client(client.id)
+    assert counts.sent == 0
+    assert counts.failed == 0
+
+
+def test_count_sent_and_failed_hides_other_clients_rows(db_session: Session) -> None:
     owner = _client(db_session)
     other = _client(db_session)
     repo = NotificationRepository(db_session)
-    row = repo.create(
-        client_id=owner.id,
-        channel=Channel.SMS,
-        recipient="+15551234567",
-        template="otp",
-        payload={},
-        idempotency_key="k1",
-    )
+    _row(db_session, owner.id, NotificationStatus.SENT)
+    _row(db_session, other.id, NotificationStatus.SENT)
+    _row(db_session, other.id, NotificationStatus.FAILED)
     db_session.flush()
-    assert repo.get_by_id_for_client(row.id, owner.id) is not None
-    assert repo.get_by_id_for_client(row.id, other.id) is None
-    assert repo.get_by_idempotency_key(owner.id, "k1") is not None
-    assert repo.get_by_idempotency_key(other.id, "k1") is None
+
+    counts = repo.count_sent_and_failed_for_client(owner.id)
+    assert counts.sent == 1
+    assert counts.failed == 0
 ```
 
-- **Patrón:** repository. La query con `client_id` **es** la regla de autorización de lectura.
-- **Por qué:** ejemplo: si el status hiciera `WHERE id = :id` sin cliente, una app podría enumerar UUIDs ajenos. El 404 uniforme sale de “no hay fila **para ti**”.
-- **Alternativa descartada:** `session.execute` en el servicio. Duplicarías el `WHERE` en accept y en status.
-- **Capa:** `app/repositories/`. Puede importar modelos. **No** puede importar FastAPI.
+- **Patrón:** repository (agregado de lectura). La query con `client_id` **es** la regla de autorización, igual que `get_by_id_for_client`.
+- **Por qué `FILTER` y no `GROUP BY`:** ejemplo: un cliente nuevo no tiene filas. `COUNT(*) FILTER (...)` igual devuelve una fila `(0, 0)`. Un `GROUP BY status` sobre cero filas no devuelve filas; tendrías que “inventar” los ceros en Python.
+- **Alternativa descartada:** `session.scalars(select(Notification).where(...)).all()` y `sum(...)`. Con miles de notificaciones/día sigue “funcionando”, pero enseña el anti-patrón de traer el archivo entero para contar las páginas. `COUNT` es trabajo de Postgres.
+- **Capa:** `app/repositories/`. Puede importar modelos y dominio. **No** puede importar FastAPI ni `app.schemas`.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-feat: add NotificationRepository for pending inserts
+feat: count sent and failed notifications per client
 
-Scope lookups by client_id so status reads cannot leak
-another app's notifications.
+Keep the aggregate in Postgres so metrics never load another
+app's rows or treat PENDING as a successful send.
 ```
 
 ---
 
-### Paso 6.3 — Schemas Pydantic v2
+### Paso 7.2 — Schema + `MetricsService`
 
-Crear [`app/schemas/notification.py`](app/schemas/notification.py). Responsabilidad: contrato HTTP de send/status. Quién lo usa: router y servicio (el servicio **devuelve** estos schemas, no modelos ORM).
-
-```python
-"""Pydantic v2 schemas for notification accept and status."""
-
-from __future__ import annotations
-
-import uuid
-from typing import Any
-
-from pydantic import BaseModel, ConfigDict, Field
-
-from app.domain.enums import Channel, NotificationStatus
-
-
-class SendNotificationRequest(BaseModel):
-    """Body for POST /send. extra=forbid so typos fail 422 instead of being dropped."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    channel: Channel
-    recipient: str = Field(min_length=1, max_length=320)
-    template: str = Field(min_length=1, max_length=128)
-    payload: dict[str, Any] = Field(default_factory=dict)
-    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
-
-
-class SendAcceptedResponse(BaseModel):
-    notification_id: uuid.UUID
-    status: NotificationStatus
-
-
-class NotificationStatusResponse(BaseModel):
-    notification_id: uuid.UUID
-    status: NotificationStatus
-```
-
-Crear [`tests/unit/schemas/test_notification.py`](tests/unit/schemas/test_notification.py):
+Crear [`app/schemas/metrics.py`](app/schemas/metrics.py). Responsabilidad: contrato HTTP de metrics. Quién lo usa: router y servicio (el servicio **devuelve** este schema, no el dataclass del repo).
 
 ```python
-import pytest
-from pydantic import ValidationError
+"""Pydantic v2 schema for client-scoped send metrics."""
 
-from app.domain.enums import Channel
-from app.schemas.notification import SendNotificationRequest
+from pydantic import BaseModel, Field
 
 
-def test_send_request_accepts_minimal_email_body() -> None:
-    body = SendNotificationRequest.model_validate(
-        {
-            "channel": "email",
-            "recipient": "user@example.com",
-            "template": "welcome",
-        }
-    )
-    assert body.channel is Channel.EMAIL
-    assert body.payload == {}
-    assert body.idempotency_key is None
-
-
-def test_send_request_rejects_unknown_channel() -> None:
-    with pytest.raises(ValidationError):
-        SendNotificationRequest.model_validate(
-            {
-                "channel": "fax",
-                "recipient": "user@example.com",
-                "template": "welcome",
-            }
-        )
-
-
-def test_send_request_rejects_uppercase_channel_token() -> None:
-    with pytest.raises(ValidationError):
-        SendNotificationRequest.model_validate(
-            {
-                "channel": "EMAIL",
-                "recipient": "user@example.com",
-                "template": "welcome",
-            }
-        )
-
-
-def test_send_request_rejects_empty_recipient() -> None:
-    with pytest.raises(ValidationError):
-        SendNotificationRequest.model_validate(
-            {
-                "channel": "sms",
-                "recipient": "",
-                "template": "otp",
-            }
-        )
-
-
-def test_send_request_rejects_empty_idempotency_key() -> None:
-    with pytest.raises(ValidationError):
-        SendNotificationRequest.model_validate(
-            {
-                "channel": "email",
-                "recipient": "user@example.com",
-                "template": "welcome",
-                "idempotency_key": "",
-            }
-        )
-
-
-def test_send_request_rejects_unknown_fields() -> None:
-    with pytest.raises(ValidationError):
-        SendNotificationRequest.model_validate(
-            {
-                "channel": "email",
-                "recipient": "user@example.com",
-                "template": "welcome",
-                "from": "nope",
-            }
-        )
+class ClientMetricsResponse(BaseModel):
+    sent: int = Field(ge=0)
+    failed: int = Field(ge=0)
 ```
 
-- **Patrón:** DTO de borde HTTP (Pydantic v2 `ConfigDict`, no `class Config`).
-- **Por qué `extra="forbid"`:** ejemplo: el cliente manda `"chanel"` (typo). Sin forbid, Pydantic lo tira y tú persistes un body incompleto o ignoras el error. Con forbid, **422** inmediato.
-- **Alternativa descartada:** validar E.164 / email regex aquí. Es un motor de notificaciones, no un CMS; el provider (Fase 9) puede rechazar un recipient malo como error permanente. No inflar esta fase.
-- **Capa:** `app/schemas/`. Puede importar enums de dominio. El dominio **no** importa este archivo.
+No hace falta `extra="forbid"`: este modelo **sale** del servidor, no entra de un body. No hace falta test unitario de schema (no hay request que rechazar); el test HTTP cubre la serialización.
 
-- **Commit (si EsrgaN autoriza):**
-
-```text
-feat: validate notification send payloads with Pydantic v2
-
-Reject unknown channels and empty recipients at the HTTP
-boundary before a row is written.
-```
-
----
-
-### Paso 6.4 — Errores 404 / 503
-
-Editar [`app/domain/exceptions.py`](app/domain/exceptions.py): añadir `NotificationNotFound`. No toques `InvalidStatusTransition`.
+Crear [`app/services/metrics_service.py`](app/services/metrics_service.py). Responsabilidad única: caso de uso “leer conteos”. Quién lo llama: el router vía `Depends`. **No** hay `commit`. **No** hay cola.
 
 ```python
-"""Domain errors for business-rule failures.
-
-HTTP mapping for status-machine errors is still a later phase.
-NotificationNotFound is mapped in this phase because accept/status need a 404.
-"""
-
-from app.domain.enums import NotificationStatus
-
-
-class DomainError(Exception):
-    """Base for business-rule failures. HTTP mapping comes in a later phase."""
-
-
-class InvalidStatusTransition(DomainError):
-    def __init__(self, from_status: NotificationStatus, to_status: NotificationStatus) -> None:
-        self.from_status = from_status
-        self.to_status = to_status
-        super().__init__(
-            f"Cannot transition from {from_status} to {to_status}"
-        )
-
-
-class NotificationNotFound(DomainError):
-    """No notification for this client (missing or not owned). Same HTTP 404 either way."""
-```
-
-Editar [`app/domain/__init__.py`](app/domain/__init__.py): exportar `NotificationNotFound` en `__all__`.
-
-**No edites** [`app/api/errors.py`](app/api/errors.py): `QueueUnavailableError` ya está en `app/services/queue.py` (paso 6.1). El servicio no importa `app.api`.
-
-Editar [`app/main.py`](app/main.py): registrar handlers **junto** a `UnauthorizedError` (puedes dejar el `include_router` de notifications para 6.6 si partes el commit; los handlers pueden existir antes). Cuerpos exactos:
-
-- 404: `{"detail": "Notification not found", "code": "not_found"}`
-- 503: `{"detail": "Queue unavailable", "code": "service_unavailable"}`
-
-Imports nuevos: `NotificationNotFound` (dominio), `QueueUnavailableError` (desde `app.services.queue`). **No** añadas handler de `InvalidStatusTransition`.
-
-- **Patrón:** excepciones de dominio vs errores del puerto. 404 = “este cliente no puede ver ese id”. 503 = “la cola no aceptó el id”.
-- **Por qué no un mapper genérico ahora:** solo hay dos formas nuevas. Un `except DomainError` global tentaría a mapear transiciones ilegales que este path no usa.
-- **Alternativa descartada:** `HTTPException` dentro del servicio. El servicio dejaría de ser testeable sin FastAPI y rompería la regla de capas.
-- **Capa:** `NotificationNotFound` → `app/domain/`. `QueueUnavailableError` → `app/services/queue.py` (el puerto). Handlers → `create_app` (composition root). API puede importar services; **services no importan api**.
-
-- **Commit (si EsrgaN autoriza):**
-
-```text
-feat: map missing notifications and queue failures to HTTP
-
-Keep 404 identical for missing and foreign ids so clients
-cannot probe another app's UUID space.
-```
-
----
-
-### Paso 6.5 — `NotificationService`
-
-Crear [`app/services/notification_service.py`](app/services/notification_service.py). Responsabilidad única: caso de uso accept + lectura de status. Quién lo llama: el router vía `Depends`. **Aquí** está el `commit`.
-
-```python
-"""Use cases: accept a send request and read status for the owning client."""
+"""Use case: read SENT/FAILED counts for the authenticated client."""
 
 from __future__ import annotations
 
 import logging
 import uuid
 
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
-
-from app.domain.exceptions import NotificationNotFound
-from app.models.notification import Notification
 from app.repositories.notification_repository import NotificationRepository
-from app.schemas.notification import (
-    NotificationStatusResponse,
-    SendAcceptedResponse,
-    SendNotificationRequest,
-)
-from app.services.queue import NotificationQueue, QueueUnavailableError
+from app.schemas.metrics import ClientMetricsResponse
 
-logger = logging.getLogger("app.notifications")
+logger = logging.getLogger("app.metrics")
 
 
-class NotificationService:
-    def __init__(
-        self,
-        session: Session,
-        repository: NotificationRepository,
-        queue: NotificationQueue,
-    ) -> None:
-        self._session = session
+class MetricsService:
+    def __init__(self, repository: NotificationRepository) -> None:
         self._repository = repository
-        self._queue = queue
 
-    def accept(
-        self,
-        client_id: uuid.UUID,
-        request: SendNotificationRequest,
-    ) -> SendAcceptedResponse:
-        """Persist PENDING, commit, enqueue id. Idempotent replays skip enqueue."""
-        if request.idempotency_key is not None:
-            existing = self._repository.get_by_idempotency_key(
-                client_id, request.idempotency_key
-            )
-            if existing is not None:
-                logger.info(
-                    "notification_idempotent_replay",
-                    extra={
-                        "notification_id": str(existing.id),
-                        "client_id": str(client_id),
-                        "channel": existing.channel.value,
-                        "status": existing.status.value,
-                    },
-                )
-                return self._to_accepted(existing)
-
-        row = self._repository.create(
-            client_id=client_id,
-            channel=request.channel,
-            recipient=request.recipient,
-            template=request.template,
-            payload=request.payload,
-            idempotency_key=request.idempotency_key,
-        )
-        try:
-            self._session.commit()
-        except IntegrityError:
-            self._session.rollback()
-            if request.idempotency_key is None:
-                raise
-            winner = self._repository.get_by_idempotency_key(
-                client_id, request.idempotency_key
-            )
-            if winner is None:
-                raise
-            return self._to_accepted(winner)
-
-        try:
-            self._queue.enqueue(row.id)
-        except QueueUnavailableError:
-            raise
-        except Exception as exc:
-            raise QueueUnavailableError() from exc
-
+    def get_client_metrics(self, client_id: uuid.UUID) -> ClientMetricsResponse:
+        """Return terminal send counts. Empty history is zeros, not an error."""
+        counts = self._repository.count_sent_and_failed_for_client(client_id)
         logger.info(
-            "notification_accepted",
+            "metrics_read",
             extra={
-                "notification_id": str(row.id),
                 "client_id": str(client_id),
-                "channel": row.channel.value,
-                "status": row.status.value,
+                "sent": counts.sent,
+                "failed": counts.failed,
             },
         )
-        return self._to_accepted(row)
-
-    def get_status(
-        self,
-        client_id: uuid.UUID,
-        notification_id: uuid.UUID,
-    ) -> NotificationStatusResponse:
-        """Return status for the owning client or raise NotificationNotFound."""
-        row = self._repository.get_by_id_for_client(notification_id, client_id)
-        if row is None:
-            raise NotificationNotFound()
-        logger.info(
-            "notification_status_read",
-            extra={
-                "notification_id": str(row.id),
-                "client_id": str(client_id),
-                "channel": row.channel.value,
-                "status": row.status.value,
-            },
-        )
-        return NotificationStatusResponse(
-            notification_id=row.id,
-            status=row.status,
-        )
-
-    @staticmethod
-    def _to_accepted(row: Notification) -> SendAcceptedResponse:
-        return SendAcceptedResponse(notification_id=row.id, status=row.status)
+        return ClientMetricsResponse(sent=counts.sent, failed=counts.failed)
 ```
-
-El `except Exception` alrededor de `enqueue` es el **único** catch ancho permitido en esta fase, y **solo** para traducir fallos del adaptador a `QueueUnavailableError`. No lo uses en el resto del servicio. `QueueUnavailableError` se re-lanza tal cual (el handler HTTP).
 
 Editar [`app/services/__init__.py`](app/services/__init__.py):
 
 ```python
 """Application services: use cases orchestrating domain and ports."""
 
+from app.services.metrics_service import MetricsService
 from app.services.notification_service import NotificationService
 from app.services.queue import (
     InMemoryNotificationQueue,
@@ -704,354 +362,158 @@ from app.services.queue import (
 
 __all__ = [
     "InMemoryNotificationQueue",
+    "MetricsService",
     "NotificationQueue",
     "NotificationService",
     "QueueUnavailableError",
 ]
 ```
 
-Crear [`tests/unit/services/test_notification_service.py`](tests/unit/services/test_notification_service.py). **Sin Postgres:** fakes en el propio archivo de test (no crees `app/utils/` ni un fake de producción).
+Crear [`tests/unit/services/test_metrics_service.py`](tests/unit/services/test_metrics_service.py). **Sin Postgres:** fake en el propio archivo de test.
 
 ```python
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
-import pytest
-from sqlalchemy.exc import IntegrityError
-
-from app.domain.enums import Channel, NotificationStatus
-from app.domain.exceptions import NotificationNotFound
-from app.models.notification import Notification
-from app.schemas.notification import SendNotificationRequest
-from app.services.notification_service import NotificationService
-from app.services.queue import InMemoryNotificationQueue, QueueUnavailableError
-
-
-class FakeSession:
-    def __init__(self, *, fail_commit: bool = False) -> None:
-        self.fail_commit = fail_commit
-        self.commit_calls = 0
-        self.rollback_calls = 0
-
-    def commit(self) -> None:
-        if self.fail_commit:
-            raise IntegrityError("INSERT", {}, Exception("unique"))
-        self.commit_calls += 1
-
-    def rollback(self) -> None:
-        self.rollback_calls += 1
+from app.repositories.notification_repository import ClientSendCounts
+from app.services.metrics_service import MetricsService
 
 
 class FakeNotificationRepository:
     def __init__(self) -> None:
-        self.rows: list[Notification] = []
+        self.counts_by_client: dict[uuid.UUID, ClientSendCounts] = {}
 
-    def create(
-        self,
-        *,
-        client_id: uuid.UUID,
-        channel: Channel,
-        recipient: str,
-        template: str,
-        payload: dict[str, Any],
-        idempotency_key: str | None,
-    ) -> Notification:
-        row = Notification(
-            id=uuid.uuid4(),
-            client_id=client_id,
-            channel=channel,
-            recipient=recipient,
-            template=template,
-            payload=payload,
-            status=NotificationStatus.PENDING,
-            idempotency_key=idempotency_key,
-        )
-        self.rows.append(row)
-        return row
-
-    def get_by_id_for_client(
-        self,
-        notification_id: uuid.UUID,
-        client_id: uuid.UUID,
-    ) -> Notification | None:
-        for row in self.rows:
-            if row.id == notification_id and row.client_id == client_id:
-                return row
-        return None
-
-    def get_by_idempotency_key(
-        self,
-        client_id: uuid.UUID,
-        idempotency_key: str,
-    ) -> Notification | None:
-        for row in self.rows:
-            if row.client_id == client_id and row.idempotency_key == idempotency_key:
-                return row
-        return None
+    def count_sent_and_failed_for_client(self, client_id: uuid.UUID) -> ClientSendCounts:
+        return self.counts_by_client.get(client_id, ClientSendCounts(sent=0, failed=0))
 
 
-def _request(**overrides: object) -> SendNotificationRequest:
-    data: dict[str, object] = {
-        "channel": "email",
-        "recipient": "user@example.com",
-        "template": "welcome",
-    }
-    data.update(overrides)
-    return SendNotificationRequest.model_validate(data)
-
-
-def test_accept_persists_pending_commits_and_enqueues_once() -> None:
-    session = FakeSession()
+def test_get_client_metrics_returns_repo_counts() -> None:
     repo = FakeNotificationRepository()
-    queue = InMemoryNotificationQueue()
-    service = NotificationService(session, repo, queue)
     client_id = uuid.uuid4()
+    repo.counts_by_client[client_id] = ClientSendCounts(sent=4, failed=2)
+    service = MetricsService(repo)
 
-    result = service.accept(client_id, _request())
+    result = service.get_client_metrics(client_id)
 
-    assert result.status is NotificationStatus.PENDING
-    assert session.commit_calls == 1
-    assert queue.enqueued == [result.notification_id]
-    assert repo.rows[0].client_id == client_id
-
-
-def test_accept_replay_returns_original_and_does_not_enqueue() -> None:
-    session = FakeSession()
-    repo = FakeNotificationRepository()
-    queue = InMemoryNotificationQueue()
-    service = NotificationService(session, repo, queue)
-    client_id = uuid.uuid4()
-    first = service.accept(
-        client_id, _request(idempotency_key="checkout-99")
-    )
-    second = service.accept(
-        client_id, _request(idempotency_key="checkout-99")
-    )
-
-    assert second.notification_id == first.notification_id
-    assert queue.enqueued == [first.notification_id]
-    assert session.commit_calls == 1
+    assert result.sent == 4
+    assert result.failed == 2
 
 
-def test_accept_integrity_error_returns_winner_without_enqueue() -> None:
-    client_id = uuid.uuid4()
-    session = FakeSession(fail_commit=True)
-    repo = FakeNotificationRepository()
-    winner = repo.create(
-        client_id=client_id,
-        channel=Channel.EMAIL,
-        recipient="user@example.com",
-        template="welcome",
-        payload={},
-        idempotency_key="race-1",
-    )
-    queue = InMemoryNotificationQueue()
-    service = NotificationService(session, repo, queue)
-
-    result = service.accept(client_id, _request(idempotency_key="race-1"))
-
-    assert result.notification_id == winner.id
-    assert session.rollback_calls == 1
-    assert queue.enqueued == []
+def test_get_client_metrics_returns_zeros_when_repo_has_no_row() -> None:
+    service = MetricsService(FakeNotificationRepository())
+    result = service.get_client_metrics(uuid.uuid4())
+    assert result.sent == 0
+    assert result.failed == 0
 
 
-def test_accept_wraps_unexpected_queue_errors_as_unavailable() -> None:
-    class BoomQueue:
-        def enqueue(self, notification_id: uuid.UUID) -> None:
-            raise RuntimeError("redis down")
-
-    service = NotificationService(
-        FakeSession(), FakeNotificationRepository(), BoomQueue()
-    )
-    with pytest.raises(QueueUnavailableError):
-        service.accept(uuid.uuid4(), _request())
-
-
-def test_get_status_raises_when_other_client() -> None:
+def test_get_client_metrics_does_not_see_another_client() -> None:
     repo = FakeNotificationRepository()
     owner = uuid.uuid4()
     other = uuid.uuid4()
-    row = repo.create(
-        client_id=owner,
-        channel=Channel.EMAIL,
-        recipient="user@example.com",
-        template="welcome",
-        payload={},
-        idempotency_key=None,
-    )
-    service = NotificationService(FakeSession(), repo, InMemoryNotificationQueue())
-    with pytest.raises(NotificationNotFound):
-        service.get_status(other, row.id)
+    repo.counts_by_client[owner] = ClientSendCounts(sent=1, failed=0)
+    repo.counts_by_client[other] = ClientSendCounts(sent=9, failed=9)
+    service = MetricsService(repo)
+
+    result = service.get_client_metrics(owner)
+
+    assert result.sent == 1
+    assert result.failed == 0
 ```
 
-- **Patrón:** application service (caso de uso). Orquesta; no contiene SQL ni HTTP.
-- **Por qué commit aquí:** ejemplo: si `get_db` commiteara al final del request, un fallo *después* del insert pero *antes* de encolar dejaría commits implícitos imposibles de razonar. `AGENTS.md` §6.4: el use case commitea a propósito.
-- **Alternativa descartada:** encolar y luego commit. Un worker futuro podría tomar el UUID antes de que Postgres vea la fila (el cartero llega a una casa que aún no existe).
-- **Capa:** `app/services/`. Puede importar dominio, repo, puerto, schemas. **No** importa routers.
+- **Patrón:** application service (caso de uso de lectura). Orquesta; no contiene SQL ni HTTP.
+- **Por qué un servicio y no el router → repo:** ejemplo: mañana quieres cachear 5 segundos o denegar a un cliente inactivo con un error de dominio. El router seguiría siendo 4 líneas. Hoy el servicio es delgado a propósito; eso no es un motivo para saltárselo.
+- **Alternativa descartada:** método `get_metrics` en `NotificationService`. Ese servicio ya pide `queue` en el constructor. Un test unitario de metrics tendría que fabricar una cola falsa que nunca se llama. Dos constructores distintos = dos casos de uso.
+- **Capa:** `app/services/`. Puede importar repo + schemas. **No** importa routers. **No** importa `app.models` (el dataclass del repo basta).
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-feat: accept notifications as PENDING then enqueue their id
+feat: add MetricsService for client-scoped send counts
 
-Commit before enqueue so a 202 always has a durable row,
-and replay the original id when the idempotency key matches.
+Keep the read model off NotificationService so metrics does
+not depend on the queue port.
 ```
 
 ---
 
-### Paso 6.6 — Composition root + router HTTP
+### Paso 7.3 — Composition root + router HTTP + tests
 
-Editar [`app/api/deps.py`](app/api/deps.py): añadir `get_notification_queue` y `get_notification_service`. No construyas el queue ni el engine dentro del endpoint.
+Editar [`app/api/deps.py`](app/api/deps.py): añadir `get_metrics_service`. No construyas el engine dentro del endpoint. `get_notification_service` **no cambia**.
+
+Imports nuevos: `MetricsService`.
 
 ```python
-def get_notification_queue(request: Request) -> NotificationQueue:
-    """Return the queue adapter owned by lifespan (app.state)."""
-    return request.app.state.notification_queue
-
-
-def get_notification_service(
+def get_metrics_service(
     session: Annotated[Session, Depends(get_db)],
-    queue: Annotated[NotificationQueue, Depends(get_notification_queue)],
-) -> NotificationService:
-    """Compose the send/status use case for one request."""
-    return NotificationService(
-        session=session,
-        repository=NotificationRepository(session),
-        queue=queue,
-    )
+) -> MetricsService:
+    """Compose the metrics read use case for one request."""
+    return MetricsService(repository=NotificationRepository(session))
 ```
 
-Añade los imports (`NotificationQueue`, `NotificationService`, `NotificationRepository`). `get_db` / `get_current_client` **no cambian** (cero `commit` en `get_db`).
-
-Crear [`app/api/routers/notifications.py`](app/api/routers/notifications.py). Thin router: parse → Depends → service.
+Crear [`app/api/routers/metrics.py`](app/api/routers/metrics.py). Thin router: Depends → service. Prefijo `/api/v1` (el path del producto es `/api/v1/metrics`, **no** `/api/v1/notifications/metrics`).
 
 ```python
-"""Accept-send and status probe. Workers dispatch in a later phase."""
+"""Client-scoped SENT/FAILED counts. Does not dispatch or rate-limit."""
 
 from __future__ import annotations
 
-import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends
 
-from app.api.deps import get_current_client, get_notification_service
+from app.api.deps import get_current_client, get_metrics_service
 from app.schemas.client import AuthenticatedClient
-from app.schemas.notification import (
-    NotificationStatusResponse,
-    SendAcceptedResponse,
-    SendNotificationRequest,
-)
-from app.services.notification_service import NotificationService
+from app.schemas.metrics import ClientMetricsResponse
+from app.services.metrics_service import MetricsService
 
-router = APIRouter(prefix="/api/v1/notifications", tags=["notifications"])
+router = APIRouter(prefix="/api/v1", tags=["metrics"])
 
 
-@router.post(
-    "/send",
-    status_code=status.HTTP_202_ACCEPTED,
-    response_model=SendAcceptedResponse,
-)
-def send_notification(
-    body: SendNotificationRequest,
+@router.get("/metrics", response_model=ClientMetricsResponse)
+def read_metrics(
     current_client: Annotated[AuthenticatedClient, Depends(get_current_client)],
-    service: Annotated[NotificationService, Depends(get_notification_service)],
-) -> SendAcceptedResponse:
-    """Persist PENDING and enqueue. Does not call a provider."""
-    return service.accept(current_client.id, body)
-
-
-@router.get(
-    "/{notification_id}/status",
-    response_model=NotificationStatusResponse,
-)
-def read_notification_status(
-    notification_id: uuid.UUID,
-    current_client: Annotated[AuthenticatedClient, Depends(get_current_client)],
-    service: Annotated[NotificationService, Depends(get_notification_service)],
-) -> NotificationStatusResponse:
-    """Return status for the owning client. 404 if missing or foreign."""
-    return service.get_status(current_client.id, notification_id)
+    service: Annotated[MetricsService, Depends(get_metrics_service)],
+) -> ClientMetricsResponse:
+    """Return SENT/FAILED counts for the authenticated client."""
+    return service.get_client_metrics(current_client.id)
 ```
 
-**Prohibido en el router:** `Session`, `select(Notification)`, `Notification` ORM, `queue.enqueue`.
+**Prohibido en el router:** `Session`, `select(Notification)`, `func.count`, `Notification` ORM.
 
 Editar [`app/main.py`](app/main.py):
 
-1. En `lifespan`, **después** de crear el engine:
+```python
+from app.api.routers.metrics import router as metrics_router
+```
+
+Junto a los otros `include_router`:
 
 ```python
-from app.services.queue import InMemoryNotificationQueue
-
-application.state.notification_queue = InMemoryNotificationQueue()
+application.include_router(health_router)
+application.include_router(clients_router)
+application.include_router(notifications_router)
+application.include_router(metrics_router)
 ```
 
-2. Handlers 404/503 (si no quedaron en 6.4) + `include_router` del notifications router junto a clients.
+Health sigue público. `/send` y `/me` siguen igual. **No** añadas handlers nuevos (401 ya existe; este GET no lanza 404/503).
 
-Health sigue público. `/me` sigue igual.
-
-- **Patrón:** composition root (`Depends` + `app.state`) + thin controller.
-- **Por qué `app.state` para la cola:** ejemplo: tests reemplazan `client.app.state.notification_queue` por un `BoomQueue` y prueban 503 **sin** parchear el servicio.
-- **Alternativa descartada:** singleton global `queue = InMemoryNotificationQueue()` a nivel de módulo. Los tests se pisan unos a otros; el lifespan ya es el dueño del engine.
-- **Capa:** `app/api/`. Prefijo `/api/v1/` obligatorio. Health sigue sin versionar.
-
-- **Commit (si EsrgaN autoriza):**
-
-```text
-feat: accept POST /send with 202 and expose notification status
-
-Keep the HTTP path free of provider I/O so clients get a
-stable notification_id under load.
-```
-
----
-
-### Paso 6.7 — Tests HTTP (Postgres real, filas commiteadas)
-
-El `db_session` hace rollback. `TestClient` abre **otro** pool (lifespan). Igual que Fase 5: hay que **commitear** el cliente.
-
-**Obligatorio:** [`tests/integration/conftest.py`](tests/integration/conftest.py) — el fixture `seeded_active_client` hoy borra solo `Client`. Tras esta fase hay filas hijas y el FK es `ON DELETE RESTRICT`. Antes de borrar el client:
-
-```python
-from sqlalchemy import delete
-
-from app.models import Client, Notification
-
-# en el teardown del fixture, DENTRO del `with factory() as session:`:
-session.execute(delete(Notification).where(Notification.client_id == client_id))
-session.execute(delete(Client).where(Client.id == client_id))
-session.commit()
-```
-
-Crear [`tests/integration/test_send.py`](tests/integration/test_send.py) — **obligatorios**:
+Crear [`tests/integration/test_metrics.py`](tests/integration/test_metrics.py) — **obligatorios**:
 
 ```python
 import uuid
 
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, delete, select
+from sqlalchemy import Engine, delete
 
 from app.core.db import create_session_factory
 from app.core.security import generate_api_key, hash_api_key
-from app.domain.enums import NotificationStatus
-from app.main import create_app
+from app.domain.enums import Channel, NotificationStatus
 from app.models import Client, Notification
-from app.services.queue import InMemoryNotificationQueue, QueueUnavailableError
 
 _UNAUTHORIZED = {
     "detail": "Invalid or missing API key",
     "code": "unauthorized",
-}
-_NOT_FOUND = {
-    "detail": "Notification not found",
-    "code": "not_found",
-}
-_UNAVAILABLE = {
-    "detail": "Queue unavailable",
-    "code": "service_unavailable",
 }
 
 _MINIMAL_BODY = {
@@ -1061,103 +523,69 @@ _MINIMAL_BODY = {
 }
 
 
-def test_send_without_api_key_returns_401(client: TestClient) -> None:
-    response = client.post("/api/v1/notifications/send", json=_MINIMAL_BODY)
+def _commit_notification(
+    engine: Engine,
+    client_id: uuid.UUID,
+    status: NotificationStatus,
+) -> None:
+    factory = create_session_factory(engine)
+    with factory() as session:
+        session.add(
+            Notification(
+                client_id=client_id,
+                channel=Channel.EMAIL,
+                recipient="user@example.com",
+                template="welcome",
+                payload={},
+                status=status,
+            )
+        )
+        session.commit()
+
+
+def test_metrics_without_api_key_returns_401(client: TestClient) -> None:
+    response = client.get("/api/v1/metrics")
     assert response.status_code == 401
     assert response.json() == _UNAUTHORIZED
 
 
-def test_send_invalid_channel_returns_422(
+def test_metrics_empty_history_returns_zeros(
     client: TestClient,
     seeded_active_client: tuple[uuid.UUID, str, str],
 ) -> None:
     _, raw, _ = seeded_active_client
-    response = client.post(
-        "/api/v1/notifications/send",
-        headers={"X-API-Key": raw},
-        json={**_MINIMAL_BODY, "channel": "fax"},
-    )
-    assert response.status_code == 422
-
-
-def test_send_returns_202_pending_and_enqueues_once(
-    client: TestClient,
-    seeded_active_client: tuple[uuid.UUID, str, str],
-    persistence_engine: Engine,
-) -> None:
-    client_id, raw, _ = seeded_active_client
-    response = client.post(
-        "/api/v1/notifications/send",
-        headers={"X-API-Key": raw},
-        json=_MINIMAL_BODY,
-    )
-    assert response.status_code == 202
-    body = response.json()
-    notification_id = uuid.UUID(body["notification_id"])
-    assert body["status"] == "PENDING"
-
-    queue = client.app.state.notification_queue
-    assert isinstance(queue, InMemoryNotificationQueue)
-    assert queue.enqueued == [notification_id]
-
-    factory = create_session_factory(persistence_engine)
-    with factory() as session:
-        row = session.get(Notification, notification_id)
-        assert row is not None
-        assert row.client_id == client_id
-        assert row.status is NotificationStatus.PENDING
-
-
-def test_send_replay_same_idempotency_key_does_not_double_enqueue(
-    client: TestClient,
-    seeded_active_client: tuple[uuid.UUID, str, str],
-) -> None:
-    _, raw, _ = seeded_active_client
-    payload = {**_MINIMAL_BODY, "idempotency_key": "checkout-99"}
-    headers = {"X-API-Key": raw}
-    first = client.post("/api/v1/notifications/send", headers=headers, json=payload)
-    second = client.post("/api/v1/notifications/send", headers=headers, json=payload)
-    assert first.status_code == 202
-    assert second.status_code == 202
-    assert first.json()["notification_id"] == second.json()["notification_id"]
-    queue = client.app.state.notification_queue
-    assert queue.enqueued == [uuid.UUID(first.json()["notification_id"])]
-
-
-def test_status_own_notification_returns_pending(
-    client: TestClient,
-    seeded_active_client: tuple[uuid.UUID, str, str],
-) -> None:
-    _, raw, _ = seeded_active_client
-    created = client.post(
-        "/api/v1/notifications/send",
-        headers={"X-API-Key": raw},
-        json=_MINIMAL_BODY,
-    )
-    notification_id = created.json()["notification_id"]
-    response = client.get(
-        f"/api/v1/notifications/{notification_id}/status",
-        headers={"X-API-Key": raw},
-    )
+    response = client.get("/api/v1/metrics", headers={"X-API-Key": raw})
     assert response.status_code == 200
-    assert response.json() == {
-        "notification_id": notification_id,
-        "status": "PENDING",
-    }
+    assert response.json() == {"sent": 0, "failed": 0}
 
 
-def test_status_foreign_or_missing_returns_same_404(
+def test_metrics_ignores_pending_from_post_send(
     client: TestClient,
     seeded_active_client: tuple[uuid.UUID, str, str],
-    persistence_engine: Engine,
 ) -> None:
     _, raw, _ = seeded_active_client
-    created = client.post(
+    accepted = client.post(
         "/api/v1/notifications/send",
         headers={"X-API-Key": raw},
         json=_MINIMAL_BODY,
     )
-    notification_id = created.json()["notification_id"]
+    assert accepted.status_code == 202
+    response = client.get("/api/v1/metrics", headers={"X-API-Key": raw})
+    assert response.status_code == 200
+    assert response.json() == {"sent": 0, "failed": 0}
+
+
+def test_metrics_counts_only_own_sent_and_failed(
+    client: TestClient,
+    seeded_active_client: tuple[uuid.UUID, str, str],
+    persistence_engine: Engine,
+) -> None:
+    owner_id, raw, _ = seeded_active_client
+    _commit_notification(persistence_engine, owner_id, NotificationStatus.SENT)
+    _commit_notification(persistence_engine, owner_id, NotificationStatus.SENT)
+    _commit_notification(persistence_engine, owner_id, NotificationStatus.FAILED)
+    _commit_notification(persistence_engine, owner_id, NotificationStatus.PENDING)
+    _commit_notification(persistence_engine, owner_id, NotificationStatus.PROCESSING)
 
     other_raw = generate_api_key()
     factory = create_session_factory(persistence_engine)
@@ -1171,130 +599,93 @@ def test_status_foreign_or_missing_returns_same_404(
         session.commit()
         other_id = other.id
     try:
-        foreign = client.get(
-            f"/api/v1/notifications/{notification_id}/status",
-            headers={"X-API-Key": other_raw},
-        )
-        missing = client.get(
-            f"/api/v1/notifications/{uuid.uuid4()}/status",
-            headers={"X-API-Key": raw},
-        )
-        assert foreign.status_code == 404
-        assert missing.status_code == 404
-        assert foreign.json() == _NOT_FOUND
-        assert missing.json() == _NOT_FOUND
+        _commit_notification(persistence_engine, other_id, NotificationStatus.SENT)
+        _commit_notification(persistence_engine, other_id, NotificationStatus.FAILED)
+
+        mine = client.get("/api/v1/metrics", headers={"X-API-Key": raw})
+        theirs = client.get("/api/v1/metrics", headers={"X-API-Key": other_raw})
+        assert mine.status_code == 200
+        assert mine.json() == {"sent": 2, "failed": 1}
+        assert theirs.status_code == 200
+        assert theirs.json() == {"sent": 1, "failed": 1}
     finally:
         with factory() as session:
             session.execute(delete(Notification).where(Notification.client_id == other_id))
             session.delete(session.get(Client, other_id))
             session.commit()
-
-
-def test_send_returns_503_when_queue_raises(
-    seeded_active_client: tuple[uuid.UUID, str, str],
-    persistence_engine: Engine,
-) -> None:
-    client_id, raw, _ = seeded_active_client
-
-    class BoomQueue:
-        def enqueue(self, notification_id: uuid.UUID) -> None:
-            raise QueueUnavailableError()
-
-    with TestClient(create_app()) as test_client:
-        test_client.app.state.notification_queue = BoomQueue()
-        response = test_client.post(
-            "/api/v1/notifications/send",
-            headers={"X-API-Key": raw},
-            json=_MINIMAL_BODY,
-        )
-        assert response.status_code == 503
-        assert response.json() == _UNAVAILABLE
-        factory = create_session_factory(persistence_engine)
-        with factory() as session:
-            rows = session.scalars(
-                select(Notification).where(Notification.client_id == client_id)
-            ).all()
-            assert len(rows) == 1
-            assert rows[0].status is NotificationStatus.PENDING
 ```
 
-El 503 **no** incluye `notification_id` en el JSON: la fila se afirma con `select` por `client_id`. El test foreign/missing usa `delete(Notification)` (SQLAlchemy 2), igual que el conftest.
+`seeded_active_client` ya borra las `Notification` del owner en el teardown ([`tests/integration/conftest.py`](tests/integration/conftest.py)). El `finally` solo limpia al **otro** cliente. No edites el conftest salvo que un test nuevo deje basura (no debería).
 
-`test_health_still_ok_without_api_key` ya existe en auth; no lo dupliques salvo que quieras un assert corto aquí. `/send` no debe aparecer en tests de health.
+**Prohibido:** `time.sleep`, Twilio, `create_all`, pegarle a Redis, mockear `MetricsService` entero en el test HTTP (queremos el `COUNT` real). No añadas un test de 429: no hay limiter.
 
-**Prohibido:** `time.sleep`, Twilio, `create_all`, `task_always_eager`, pegarle a Redis, mockear `NotificationService` entero en el test HTTP (queremos la fila real).
-
-- **Patrón:** test de integración HTTP + BD real + puerto reemplazable.
-- **Por qué commit y no rollback:** las dos cajas (pool del test vs pool de la app) no comparten la transacción. Igual que `/me`.
-- **Alternativa descartada:** Celery eager. Aún no hay Celery; el puerto in-memory **es** el doble.
-- **Capa:** `tests/integration/`.
+- **Patrón:** composition root (`Depends`) + thin controller + test de integración HTTP + BD real.
+- **Por qué insertar `SENT` a mano:** ejemplo: el cartero (worker) aún no existe. El test dice “si **ya hubiera** dos entregas y un fallo, el mostrador mostraría 2 y 1”. No fingimos el envío; sembramos el estado terminal.
+- **Alternativa descartada:** endpoint Prometheus `text/plain` con `sent_total`. Eso lo scrapearía Grafana, no la app checkout. El cliente máquina necesita JSON igual que `/status`.
+- **Capa:** `app/api/` + `tests/integration/`. Prefijo `/api/v1/` obligatorio. Health sigue sin versionar.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-test: accept send with 202 and hide foreign notification ids
+feat: expose GET /metrics for authenticated client send counts
 
-Prove persist-then-enqueue against local Postgres, including
-idempotent replay and 404 isolation between clients.
+Scope COUNT to the API key so one app cannot read another
+app's success and failure totals.
 ```
 
 ---
 
-### Paso 6.8 — Docs de status + README
+### Paso 7.4 — Docs de status + README
 
 Editar [`docs/STATUS.md`](docs/STATUS.md) **solo al cerrar la implementación** (otro turno, o el final de este PLAN cuando el código exista):
 
-- Marcar Fase 6 hecha: `POST /send` 202, `GET …/status`, `NotificationService`, puerto in-memory, idempotencia.
-- Decir qué **sigue**: Fase 7 = métricas (conteos por cliente). Todavía no Redis/Celery.
-- “Qué no existe” sigue incluyendo Redis, Token Bucket, Celery, providers, DLQ, Docker, mapper de `InvalidStatusTransition`.
-- No marcar Fase 7 como hecha.
+- Marcar Fase 7 hecha: `GET /api/v1/metrics` 200 `{sent, failed}`, `MetricsService`, `COUNT` por `client_id`, ceros si solo hay `PENDING`.
+- Decir qué **sigue**: Fase 8 = Token Bucket en Redis Homebrew + HTTP 429. Todavía no hay Celery.
+- “Qué no existe” **deja de listar** `GET /metrics`. Sigue incluyendo Redis, Token Bucket, Celery, providers, DLQ, Docker, mapper de `InvalidStatusTransition`.
+- No marcar Fase 8 como hecha.
 
 Editar [`README.md`](README.md):
 
-- Status: “Phase 6: `POST /api/v1/notifications/send` returns 202 and persists PENDING; in-memory queue port; still no Celery/Redis”.
-- Curl (después del seed de cliente de Fase 5):
+- Status: “Phase 7: `GET /api/v1/metrics` returns `{sent, failed}` per API key from Postgres; still no Redis/Celery”.
+- Curl (después del de status):
 
 ```bash
-curl -i -H "X-API-Key: PASTE_RAW_KEY" -H "Content-Type: application/json" \
-  -d '{"channel":"email","recipient":"user@example.com","template":"welcome","payload":{"name":"Ada"},"idempotency_key":"welcome-1"}' \
-  http://127.0.0.1:8000/api/v1/notifications/send
-# 202 {"notification_id":"...","status":"PENDING"}
-
-curl -i -H "X-API-Key: PASTE_RAW_KEY" \
-  http://127.0.0.1:8000/api/v1/notifications/NOTIFICATION_ID/status
-# 200 {"notification_id":"...","status":"PENDING"}
+curl -i -H "X-API-Key: PASTE_RAW_KEY" http://127.0.0.1:8000/api/v1/metrics
+# 200 {"sent":0,"failed":0}
+# zeros until a later worker marks rows SENT or FAILED
 ```
 
-- Dejar claro: **no sale ningún email**. La cola in-memory no despacha.
-- Docker sigue “fase posterior”.
+- Dejar claro: **POST /send no mueve estos números**. Docker sigue “fase posterior”.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-docs: record accept-send 202 and status probe in the runbook
+docs: record GET /metrics in the local runbook
 ```
 
 ---
 
 ## 4. Checklist de cierre
 
-- [ ] `pytest -q` verde (44 anteriores + queue + schemas + service fakes + repo + send HTTP)
+- [ ] `pytest -q` verde (66 anteriores + COUNT repo + MetricsService fake + metrics HTTP)
 - [ ] `ruff check app tests` limpio
 - [ ] `app/domain/` sigue sin importar FastAPI/SQLAlchemy/Pydantic
-- [ ] Router de notifications no importa `app.models` ni `Session`
+- [ ] Router de metrics no importa `app.models` ni `Session`
+- [ ] `MetricsService` no importa cola ni hace `commit`
 - [ ] Cero `create_all`, cero migración nueva, cero `commit` en `get_db`
-- [ ] `POST /send` → 202 + fila `PENDING` + `enqueue` una vez
-- [ ] Replay con misma `idempotency_key` → mismo id, sin segundo enqueue
-- [ ] `GET …/status` 200 propio / 404 ajeno o missing (mismo cuerpo)
+- [ ] `GET /api/v1/metrics` → 200 `{sent, failed}` con `X-API-Key`
+- [ ] Sin key → 401 idéntico a `/me`
+- [ ] Historial vacío o solo `PENDING` → `{"sent":0,"failed":0}` (no 404)
+- [ ] Filas de otro cliente no aparecen en los conteos
 - [ ] `GET /health` sigue 200 sin `X-API-Key`
-- [ ] Cero Celery, cero Redis, cero JWT, cero Docker, cero `BackgroundTasks`, cero `/metrics`
-- [ ] 3–6 learning points en español **simple** para EsrgaN (qué es 202 vs 200, qué es un puerto vs Celery, por qué commit-then-enqueue, qué es idempotencia, por qué 404 no dice “no es tuyo”, por qué la cola in-memory no envía)
+- [ ] Cero Redis, cero Celery, cero JWT, cero Docker, cero Prometheus, cero 429
+- [ ] 3–6 learning points en español **simple** para EsrgaN (qué es `sent` vs `PENDING`, por qué COUNT y no sumar en Python, por qué no 404 vacío, por qué un servicio sin cola, por qué no Prometheus, por qué insertar `SENT` en tests)
 - [ ] Commits hechos o mensajes esperando a EsrgaN
 
-**Prohibido al terminar:** worker Celery, `import twilio`, Token Bucket, Compose, métricas, mapper de transiciones.
+**Prohibido al terminar:** worker Celery, `import twilio`, Token Bucket, Compose, mapper de transiciones, campo `pending` en el JSON.
 
 ---
 
 ## 5. Qué sigue (no implementar)
 
-Siguiente `PLAN.md` (otra reescritura): **Metrics** — conteos de envíos OK vs fallo **por cliente autenticado**. Todavía no hay Redis ni Celery: los conteos salen de Postgres (`SENT`/`FAILED`). Hoy casi todo será `PENDING`; el endpoint y la query igual se construyen. No implementar eso en este turno.
+Siguiente `PLAN.md` (otra reescritura): **Rate limit** — Token Bucket en Redis **Homebrew**, atómico, por API key (fallback IP), HTTP **429** + `Retry-After`. Eso va **antes** de persist/enqueue. No implementar Redis, 429 ni Celery en este turno.

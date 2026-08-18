@@ -15,6 +15,7 @@ from app.core.security import hash_api_key
 from app.repositories.client_repository import ClientRepository
 from app.repositories.notification_repository import NotificationRepository
 from app.schemas.client import AuthenticatedClient
+from app.services.metrics_service import MetricsService
 from app.services.notification_service import NotificationService
 from app.services.queue import NotificationQueue
 
@@ -66,3 +67,11 @@ def get_notification_service(
         repository=NotificationRepository(session),
         queue=queue,
     )
+
+
+def get_metrics_service(
+    session: Annotated[Session, Depends(get_db)],
+) -> MetricsService:
+    """Compose the metrics read use case for one request."""
+    return MetricsService(repository=NotificationRepository(session))
+
