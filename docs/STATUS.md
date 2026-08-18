@@ -1,8 +1,8 @@
 # STATUS.md — foto técnica (qué hay / qué no)
 
 Última actualización: **Fase 6 cerrada en código**; [`PLAN.md`](../PLAN.md) sigue siendo **Fase 6** hasta que EsrgaN pida reescribirlo.  
-HEAD local: `feat/phase-6-accept-send` (parte de `feat/phase-5-api-keys` = `f6a5058`).  
-`origin/main` = `be14f38` (PR **#5**, Fase 4). Fases 5–6 **no** están en `main`.  
+HEAD local: `feat/phase-6-accept-send`.  
+`origin/main` = `4fe08cc` (PR **#6**, squash de Fase 5). Esta rama añade Fase 6 encima.  
 `pytest -q` → **66 passed**. `ruff check app tests` limpio.
 
 ## Escala (no olvidar)
