@@ -407,6 +407,7 @@ Allowed types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`, `ci`.
 
 - One concern per commit. Do not mix formatting-only noise with behavior.
 - Never commit `.env`, credential files, private keys, dump files, or **`docs/EXPLANATIONS.md`**.
+- **Never** add `Co-authored-by`, `Signed-off-by`, or any other commit trailer naming Cursor, an agent, or an AI tool. Commits are EsrgaN's authorship only unless EsrgaN explicitly adds a human co-author.
 - If EsrgaN asks to commit secrets, refuse and explain.
 
 ### 7.4 Push and PRs
@@ -597,6 +598,7 @@ These are defects, not style nits. Do not land them.
 - Silent `None` settings, defaulting `DATABASE_URL` to a hidden local socket that only works on one machine.
 - Mutating `SENT` notifications back to `PENDING` as a retry mechanism.
 - Committing or pushing `docs/EXPLANATIONS.md` (local handbook; gitignored by design).
+- Adding `Co-authored-by: Cursor` (or any agent/AI trailer) to commit messages.
 - Committing to `main`, force-pushing shared history, or committing when EsrgaN did not ask.
 
 ---
