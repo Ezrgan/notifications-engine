@@ -6,13 +6,15 @@ import os
 from collections.abc import Generator
 
 # Must run BEFORE importing app.main: create_app() executes at import time and
-# Settings() fails without SECRET_KEY / DATABASE_URL (fail-fast).
+# Settings() fails without SECRET_KEY / DATABASE_URL / REDIS_URL (fail-fast).
 os.environ["DATABASE_URL"] = os.environ.get(
     "TEST_DATABASE_URL",
     "postgresql+psycopg://localhost:5432/notifications_engine_test",
 )
 os.environ.setdefault("SECRET_KEY", "pytest-secret-key")
 os.environ.setdefault("ENVIRONMENT", "test")
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+os.environ.setdefault("RATE_LIMIT_PER_MINUTE", "10")
 
 import pytest
 from fastapi.testclient import TestClient

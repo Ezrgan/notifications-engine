@@ -1,8 +1,7 @@
 """Application settings loaded from the environment.
 
-`secret_key` and `database_url` are required so a misconfigured process fails at
-boot instead of running with silent empty config. `REDIS_URL` is intentionally
-absent: nothing in this phase opens Redis.
+`secret_key`, `database_url`, and `redis_url` are required so a misconfigured
+process fails at boot instead of running with silent empty config.
 """
 
 from functools import lru_cache
@@ -12,10 +11,11 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PSYCOPG_URL_PREFIX = "postgresql+psycopg://"
+_REDIS_URL_PREFIX = "redis://"
 
 
 class Settings(BaseSettings):
-    """Fail-fast settings: boot dies without SECRET_KEY and a psycopg DATABASE_URL."""
+    """Fail-fast settings: boot dies without secrets and reachable-store URLs."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     secret_key: SecretStr = Field(min_length=16)
     database_url: SecretStr = Field(min_length=1)
+    redis_url: SecretStr = Field(min_length=1)
+    rate_limit_per_minute: int = Field(default=10, ge=1)
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -47,6 +49,15 @@ class Settings(BaseSettings):
                 "DATABASE_URL must start with 'postgresql+psycopg://' "
                 "(psycopg v3 driver required)"
             )
+        return value
+
+    @field_validator("redis_url")
+    @classmethod
+    def require_redis_url(cls, value: SecretStr) -> SecretStr:
+        """Reject anything that is not a redis:// URL (no Unix socket, no rediss yet)."""
+        raw = value.get_secret_value()
+        if not raw.startswith(_REDIS_URL_PREFIX):
+            raise ValueError("REDIS_URL must start with 'redis://'")
         return value
 
 

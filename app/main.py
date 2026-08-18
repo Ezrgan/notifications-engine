@@ -6,8 +6,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from redis import Redis
 
 from app.api.errors import UnauthorizedError
+from app.api.middleware.rate_limit import RateLimitMiddleware
 from app.api.middleware.request_id import RequestIdMiddleware
 from app.api.routers.clients import router as clients_router
 from app.api.routers.health import router as health_router
@@ -16,13 +18,14 @@ from app.api.routers.notifications import router as notifications_router
 from app.core.config import get_settings
 from app.core.db import create_engine_from_url, create_session_factory
 from app.core.logging import configure_logging
+from app.core.rate_limit import TokenBucket
 from app.domain.exceptions import NotificationNotFound
 from app.services.queue import InMemoryNotificationQueue, QueueUnavailableError
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-    """Configure logging and own the Postgres engine for the process lifetime."""
+    """Configure logging and own the Postgres engine and Redis client for the process."""
     settings = get_settings()
     configure_logging(settings)
     logger = logging.getLogger("app")
@@ -32,8 +35,21 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.session_factory = create_session_factory(engine)
     application.state.notification_queue = InMemoryNotificationQueue()
 
+    if settings.environment == "test":
+        from fakeredis import FakeRedis
+
+        redis_client: Redis | FakeRedis = FakeRedis(decode_responses=True)
+    else:
+        redis_client = Redis.from_url(
+            settings.redis_url.get_secret_value(),
+            decode_responses=True,
+        )
+    application.state.redis = redis_client
+    application.state.token_bucket = TokenBucket(redis_client)
+
     logger.info("application_started", extra={"environment": settings.environment})
     yield
+    application.state.redis.close()
     engine.dispose()
     logger.info("application_stopped")
 
@@ -46,6 +62,7 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    application.add_middleware(RateLimitMiddleware)
     application.add_middleware(RequestIdMiddleware)
 
     @application.exception_handler(UnauthorizedError)
