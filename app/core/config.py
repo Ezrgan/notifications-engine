@@ -5,10 +5,10 @@ so a misconfigured process fails at boot instead of running with silent empty co
 """
 
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _PSYCOPG_URL_PREFIX = "postgresql+psycopg://"
 _REDIS_URL_PREFIX = "redis://"
@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     redis_url: SecretStr = Field(min_length=1)
     celery_broker_url: SecretStr = Field(min_length=1)
     rate_limit_per_minute: int = Field(default=10, ge=1)
+    max_delivery_attempts: int = Field(default=5, ge=1)
+    # Tuple env values are JSON-decoded before validators; CSV 5,15,45 is not JSON.
+    delivery_retry_countdowns: Annotated[tuple[int, ...], NoDecode] = Field(
+        default=(5, 15, 45)
+    )
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -68,6 +73,25 @@ class Settings(BaseSettings):
         raw = value.get_secret_value()
         if not raw.startswith(_REDIS_URL_PREFIX):
             raise ValueError("CELERY_BROKER_URL must start with 'redis://'")
+        return value
+
+    @field_validator("delivery_retry_countdowns", mode="before")
+    @classmethod
+    def parse_retry_countdowns(cls, value: object) -> object:
+        """Accept CSV from env (5,15,45) or an already-parsed sequence."""
+        if isinstance(value, str):
+            parts = tuple(int(piece.strip()) for piece in value.split(",") if piece.strip())
+            return parts
+        return value
+
+    @field_validator("delivery_retry_countdowns")
+    @classmethod
+    def require_positive_countdowns(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        """Empty or non-positive waits are not a backoff schedule."""
+        if not value or any(seconds < 1 for seconds in value):
+            raise ValueError(
+                "DELIVERY_RETRY_COUNTDOWNS must be a comma-separated list of integers >= 1"
+            )
         return value
 
 
