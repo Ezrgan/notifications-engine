@@ -1,4 +1,4 @@
-"""Accept-send and status probe. Workers dispatch in a later phase."""
+"""Accept-send and status probe. The worker process dispatches; this router does not."""
 
 from __future__ import annotations
 

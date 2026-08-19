@@ -1,13 +1,14 @@
 """Queue port for accepted notifications.
 
-The HTTP path enqueues an id; it never talks to Celery or a provider.
-InMemoryNotificationQueue is the v1 adapter until a later phase swaps Celery in.
+The HTTP path enqueues an id; it never talks to a provider.
+InMemoryNotificationQueue is the test adapter. CeleryNotificationQueue is local/prod.
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import Protocol
+from collections.abc import Callable
+from typing import Any, Protocol
 
 
 class QueueUnavailableError(Exception):
@@ -33,3 +34,23 @@ class InMemoryNotificationQueue:
 
     def enqueue(self, notification_id: uuid.UUID) -> None:
         self.enqueued.append(notification_id)
+
+
+class CeleryNotificationQueue:
+    """Publish notification ids to the Celery ``notifications`` queue."""
+
+    def __init__(self, apply_async: Callable[..., Any] | None = None) -> None:
+        self._apply_async = apply_async
+
+    def enqueue(self, notification_id: uuid.UUID) -> None:
+        publish = self._apply_async
+        if publish is None:
+            from app.workers.tasks import deliver_notification
+
+            publish = deliver_notification.apply_async
+        try:
+            publish(args=[str(notification_id)], queue="notifications")
+        except QueueUnavailableError:
+            raise
+        except Exception as exc:
+            raise QueueUnavailableError() from exc
