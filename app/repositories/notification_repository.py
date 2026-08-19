@@ -62,6 +62,10 @@ class NotificationRepository:
             )
         )
 
+    def get_by_id(self, notification_id: uuid.UUID) -> Notification | None:
+        """Load by primary key. Worker path only; not an HTTP authorization check."""
+        return self._session.get(Notification, notification_id)
+
     def get_by_idempotency_key(
         self,
         client_id: uuid.UUID,
