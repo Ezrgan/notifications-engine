@@ -138,3 +138,53 @@ def test_celery_broker_url_without_redis_prefix_fails(
     monkeypatch.setenv("CELERY_BROKER_URL", "amqp://localhost")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_delivery_retry_settings_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", _TEST_REDIS_URL)
+    monkeypatch.setenv("CELERY_BROKER_URL", _TEST_CELERY_BROKER_URL)
+    monkeypatch.delenv("MAX_DELIVERY_ATTEMPTS", raising=False)
+    monkeypatch.delenv("DELIVERY_RETRY_COUNTDOWNS", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.max_delivery_attempts == 5
+    assert settings.delivery_retry_countdowns == (5, 15, 45)
+
+
+def test_delivery_retry_countdowns_parse_csv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", _TEST_REDIS_URL)
+    monkeypatch.setenv("CELERY_BROKER_URL", _TEST_CELERY_BROKER_URL)
+    monkeypatch.setenv("DELIVERY_RETRY_COUNTDOWNS", "5,15,45")
+    settings = Settings(_env_file=None)
+    assert settings.delivery_retry_countdowns == (5, 15, 45)
+
+
+def test_delivery_retry_countdowns_reject_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", _TEST_REDIS_URL)
+    monkeypatch.setenv("CELERY_BROKER_URL", _TEST_CELERY_BROKER_URL)
+    monkeypatch.setenv("DELIVERY_RETRY_COUNTDOWNS", "5,0,45")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_max_delivery_attempts_below_one_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", _TEST_REDIS_URL)
+    monkeypatch.setenv("CELERY_BROKER_URL", _TEST_CELERY_BROKER_URL)
+    monkeypatch.setenv("MAX_DELIVERY_ATTEMPTS", "0")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
