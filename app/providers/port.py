@@ -1,7 +1,7 @@
 """Application-owned provider port.
 
-Workers call this; routers must not. Retry policy lives in the worker (later),
-not inside an adapter.
+Workers call this; routers must not. Retry policy lives in DispatchService
+and the worker task, not inside an adapter.
 """
 
 from __future__ import annotations
@@ -13,7 +13,15 @@ from app.domain.enums import Channel
 
 
 class ProviderError(Exception):
-    """The channel adapter could not deliver. Dispatch maps this to FAILED."""
+    """The channel adapter could not deliver. Unclassified errors are retryable."""
+
+
+class TransientProviderError(ProviderError):
+    """Timeout / 5xx-equivalent. Dispatch may retry with backoff."""
+
+
+class PermanentProviderError(ProviderError):
+    """Bad recipient / 4xx-equivalent. Dispatch marks FAILED without backoff."""
 
 
 @dataclass(frozen=True)
