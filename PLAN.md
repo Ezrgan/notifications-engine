@@ -1,9 +1,9 @@
-# PLAN.md — Fase 9: Celery worker en el mismo venv + provider simulado
+# PLAN.md — Fase 10: retries con backoff + cola `notifications.dlq`
 
 > **REGLA OBLIGATORIA PARA TODOS LOS AGENTES:**
-> Antes de ejecutar cualquier paso, leer y acatar [`AGENTS.md`](./AGENTS.md), [`.cursor/rules/`](./.cursor/rules/) (sobre todo `celery.mdc`, `fastapi.mdc`, `testing.mdc` y `anti-overengineering.mdc`) y [`docs/HOW_TO_WRITE_THE_NEXT_PLAN.md`](./docs/HOW_TO_WRITE_THE_NEXT_PLAN.md).
+> Antes de ejecutar cualquier paso, leer y acatar [`AGENTS.md`](./AGENTS.md), [`.cursor/rules/`](./.cursor/rules/) (sobre todo `celery.mdc`, `testing.mdc`, `fastapi.mdc` y `anti-overengineering.mdc`) y [`docs/HOW_TO_WRITE_THE_NEXT_PLAN.md`](./docs/HOW_TO_WRITE_THE_NEXT_PLAN.md).
 > Este archivo es el **único plan ejecutable**. Describe **una sola fase**. Cuando cierre, EsrgaN **reescribe** `PLAN.md` entero (ver el playbook en `docs/`).
-> No implementar retries, DLQ, Beat, JWT, alta HTTP de clientes, Prometheus, Mailtrap/Twilio reales ni Docker.
+> No implementar Beat, replay admin, JWT, alta HTTP de clientes, Prometheus, Mailtrap/Twilio reales ni Docker.
 
 > **Cómo está pensado este documento:**
 > Un agente debe poder implementarlo **sin inventar**. Cada paso: archivos exactos, contrato, tests, commit propuesto, qué no tocar.
@@ -11,12 +11,11 @@
 > Enseñar a EsrgaN en **español simple**, con ejemplos. Sin jerga sin definir.
 
 > **Estado de partida (verificado):**
-> Rama actual `feat/phase-8-token-bucket` = `ea4da85` (mismo árbol que `origin/main` = `03c28d6`, PR **#9**).
-> `main` local = `7a2b828` — **atrás**; no partir de `main` local. Partir de `origin/main` (`03c28d6`) o de `feat/phase-8-token-bucket` (`ea4da85`).
-> `pytest -q` → **90 passed**. `ruff check app tests` limpio. `redis-cli ping` → `PONG`. Paquete `celery` **no** está en el venv.
-> Hay `POST /send` → 202 + `PENDING` + cola **in-memory**, Token Bucket Redis índice **0**, `GET …/status`, `GET /metrics`.
-> `app/workers/__init__.py` y `app/providers/__init__.py` existen como stubs vacíos. **No** hay `celery_app.py`, `tasks.py`, puerto de provider ni `DispatchService`.
-> `pyproject.toml` no lista `celery`. Settings no tiene `CELERY_BROKER_URL`.
+> Rama actual `feat/phase-9-celery-worker` = `a602b2b` (phase 9 **no** está en `origin/main`).
+> `origin/main` = `03c28d6` (fases 1–8). `main` local = `7a2b828` — **atrás**; no partir de ahí ni de `origin/main`.
+> `pytest -q` → **105 passed**. `ruff check app tests` limpio. `mypy app` limpio.
+> Hay worker Celery en el mismo venv, provider simulado que **siempre acierta**, `DispatchService` que ante cualquier error marca `FAILED` y termina (`max_retries=0`). Cero backoff. Cero cola `notifications.dlq`.
+> HTTP (`POST /send` 202 `PENDING`, Token Bucket, metrics) **no cambia de contrato**.
 
 ---
 
@@ -24,28 +23,26 @@
 
 | # | Decisión | Valor congelado |
 | --- | --- | --- |
-| D1 | Idea de la fase | El mostrador (`POST /send`) **sigue sin enviar**. Guarda `PENDING`, pone el id en la cola y responde **202**. Un **segundo proceso** en el **mismo venv** (`celery worker`) toma ese id, pasa `PENDING → PROCESSING`, llama al provider **simulado**, pasa `PROCESSING → SENT`. Ejemplo: el checkout cobra y recibe `202` en 20 ms; el email “sale” (simulado) unos segundos después, cuando el worker está vivo. |
-| D2 | Celery es un paquete | `celery[redis]` se instala en el venv con `uv pip`. **No** es una imagen Docker. Ejemplo: terminal 1 `uvicorn …`, terminal 2 `celery -A app.workers.celery_app worker …`. Dos procesos Python, cero Compose. |
-| D3 | Broker ≠ cubo | Token Bucket sigue en `REDIS_URL` = `redis://localhost:6379/0`. Celery usa **otro índice** del **mismo** Redis: `CELERY_BROKER_URL` = `redis://localhost:6379/1`. Ejemplo: las fichas del torniquete no se mezclan con los tickets de cocina. Prohibido reutilizar `/0` como broker. Prohibido un segundo `redis-server`. |
-| D4 | Settings | `celery_broker_url: SecretStr` **obligatorio**, prefijo `redis://`. Sin `CELERY_BROKER_URL` el proceso **no arranca** (fail-fast, igual que `REDIS_URL`). Tests HTTP no hablan con el broker (D12); igual deben setear la variable. |
-| D5 | Puerto de cola | El Protocol `NotificationQueue` **no se toca**. Nuevo adapter `CeleryNotificationQueue.enqueue(id)` → `deliver_notification.apply_async(args=[str(id)], queue="notifications")`. `InMemoryNotificationQueue` **sigue** para `ENVIRONMENT=test`. `NotificationService.accept` **no cambia**. |
-| D6 | Payload de la task | Solo el UUID en **string**. Prohibido pasar el modelo ORM, el body HTTP o el API key. Ejemplo: el ticket dice “pedido 42”, no “el plato caliente en la bandeja”. El worker **carga** la fila desde Postgres. |
-| D7 | Cola nombrada | Queue Kombu **`notifications`**. No dejar el default `celery` (ese nombre no enseña nada). `task_ignore_result=True`: la verdad está en Postgres, no en un result backend. Serializer **JSON** (no pickle). `task_acks_late=True`, `worker_prefetch_multiplier=1`. |
-| D8 | Cero retries / DLQ | `@task(..., max_retries=0)`. **No** countdowns 5s/15s/45s. **No** cola `notifications.dlq`. **No** Celery Beat. Eso es Fase 10. Si el provider simulado funciona, la fila acaba `SENT`. |
-| D9 | Provider = puerto + simulado | Protocol `NotificationProvider.send(message)` en `app/providers/port.py`. Adapter `SimulatedNotificationProvider` en `app/providers/simulated.py`: log + return, **cero** red. Un solo adapter para email/sms/push/webhook. Prohibido `import twilio` / Mailtrap. La política de reintento **no** vive en el adapter. |
-| D10 | Caso de uso dispatch | `DispatchService` en `app/services/dispatch.py`. El worker lo llama; los routers **no**. Usa `assert_transition` del dominio (nunca un `row.status = SENT` a pelo desde `PENDING`). El servicio **posee** el `commit`, igual que `accept`. |
-| D11 | Máquina de estados | `PENDING → PROCESSING` (commit) → `provider.send` → `PROCESSING → SENT` + `sent_at` (commit). Si ya es `SENT` o `FAILED`, **no** llamar al provider (no doble envío). Si ya es `PROCESSING` (worker murió a mitad), reintentar el send (recuperación). `PENDING → SENT` es **ilegal**: hay que persistir `PROCESSING`. Missing id → log y return, no crash infinito. |
-| D12 | Tests vs local | `ENVIRONMENT=test` → lifespan **sigue** `InMemoryNotificationQueue` (los 90 tests de 202/`PENDING` no arrancan un worker). `local` / `production` → `CeleryNotificationQueue`. Pytest **no** exige `celery worker` vivo. Cero `time.sleep`. Cero `task_always_eager` en el fixture HTTP (rompería `test_send_returns_202_pending_*`). |
-| D13 | Fallo del provider (esta fase) | `ProviderError` → `PROCESSING → FAILED` + `error_message` (truncado a 512), commit, la task **termina** (no re-raise). El simulado **nunca** lanza. Fase 10 sustituirá este FAILED inmediato por backoff + DLQ. Otras excepciones del provider: también `FAILED` (un solo `except ProviderError` no basta — captura `Exception` **después** de persistir PROCESSING, log `exc_info`, marca FAILED). No `except: pass`. |
-| D14 | Broker caído en `enqueue` | `CeleryNotificationQueue` lanza `QueueUnavailableError`. El handler HTTP **503** `queue unavailable` **ya existe**. La fila `PENDING` **sí** queda (igual que hoy: commit primero, luego enqueue). No inventes un rollback del persist. |
-| D15 | Repositorio | Nuevo `NotificationRepository.get_by_id(id)` (PK, sin filtrar `client_id`). El worker es interno. **No** uses `get_by_id_for_client` aquí. **No** abras un GET HTTP público “por id sin auth”. Cero Alembic: `sent_at` y `error_message` ya existen. |
-| D16 | Composition root del worker | El worker **no** llama `create_app()`. Engine + session factory en `app/workers/runtime.py` (lazy singleton). Task: abre sesión, construye `DispatchService` + `SimulatedNotificationProvider`, `dispatch`, cierra sesión. Prohibido importar `app.api.routers`. |
-| D17 | HTTP intacto | Routers, Token Bucket, auth, metrics, health: **no cambian de contrato**. `POST /send` sigue 202 `PENDING`. `GET /status` ya admite `PROCESSING`/`SENT` (el enum ya está). `GET /metrics` pasará a `sent: 1` **después** de que el worker marque `SENT` — no en el mismo request. |
-| D18 | Libs | `celery[redis]>=5.4,<6` en **dependencies** (el API también llama `apply_async`). Prohibido `flower`, `celery-redbeat`, `twilio`, `httpx` de más, `BackgroundTasks`, JWT, `kombu` extra a mano (ya viene con Celery). |
-| D19 | Logs | Eventos: `notification_dispatch_started`, `notification_sent`, `notification_dispatch_skipped`, `notification_dispatch_failed`, `notification_dispatch_missing`, `simulated_send`. `extra=` con `notification_id`, `client_id`, `channel`, `status`, `retry_count`. Nunca API key ni payload completo. |
-| D20 | Fuera de esta fase | Retries, DLQ, Beat, mapper HTTP de `InvalidStatusTransition`, `ClientService`, cablear `Client.rate_limit_per_minute`, Mailtrap/Twilio, Dockerfile/Compose, eager por defecto, result backend Redis. |
-| D21 | Git | Rama `feat/phase-9-celery-worker` **desde** `origin/main` (`03c28d6`) o `feat/phase-8-token-bucket` (`ea4da85`) — mismo árbol. **No** desde `main` local (`7a2b828`). Commits **solo si EsrgaN lo pide**. |
-| D22 | Docker / extras | Prohibidos. No Kafka, JWT, Prisma, Compose, segundo Redis. |
+| D1 | Idea de la fase | Si el provider **falla de forma temporal** (timeout, 5xx), el worker **no** tira la toalla: espera y vuelve a intentar. Si se acaba el presupuesto o el fallo es **permanente** (destinatario mal, 4xx), la fila queda `FAILED` y el id se publica en la cola **`notifications.dlq`** para inspeccionar. Ejemplo: Mailtrap está caído 20 s → el email sale en el segundo intento. Un `recipient` inventado → `FAILED` al momento, sin esperar 5+15+45 s. |
+| D2 | Presupuesto de intentos | **5 intentos** = 1 inicial + 4 reintentos. Setting `max_delivery_attempts` default **5**, `ge=1`. Ejemplo: `retry_count` empieza en 0; cada send fallido suma 1; cuando `retry_count` llega a 5, se acaba. |
+| D3 | Backoff | Countdowns **5 s, 15 s, 45 s**. Intentos extra (el 4.º reintento, intento 5) **repiten 45 s** (tope). No continuar el factor 3 hasta 135 s: en local eso parece “colgado”. Env `DELIVERY_RETRY_COUNTDOWNS=5,15,45`. Función de dominio: índice `min(retry_count - 1, len(schedule) - 1)`. |
+| D4 | Quién posee la regla | **`DeliveryRetryPolicy`** (dominio) decide *si* reintentar y *cuántos segundos*. **`DispatchService`** aplica transiciones, incrementa `retry_count`, persiste. **La task Celery** solo obedece el resultado (`self.retry` o publicar DLQ). El adapter **no** reintenta. |
+| D5 | Transiente vs permanente | `TransientProviderError` y cualquier `Exception` no clasificada (incl. `ProviderError` pelado) → **reintentable**. `PermanentProviderError` → `FAILED` + DLQ **sin** backoff, aunque queden intentos. Ejemplo: “el horno está ocupado” vs “la dirección no existe”. |
+| D6 | Máquina de estados | Reintento: `PROCESSING → PENDING` (ya es legal). Durante la espera, `GET /status` muestra `PENDING` otra vez (no `FAILED`). Agotado o permanente: `PROCESSING → FAILED`. `SENT` y `FAILED` siguen terminales: no se llama al provider. `PENDING → SENT` sigue ilegal. |
+| D7 | `retry_count` | Entero en la fila (columna **ya existe**, cero Alembic). Se incrementa **después** de un send fallido, **antes** de decidir retry vs FAILED. Primer fallo transiente → `retry_count=1`, countdown 5 s. Quinto fallo → `retry_count=5` → FAILED. |
+| D8 | Resultado del use case | `dispatch()` **devuelve** `DispatchResult` (`sent` / `skipped` / `missing` / `retry` / `failed`). `retry` lleva `countdown_seconds`. `failed` lleva `dead_letter=True`. Prohibido que `DispatchService` importe Celery. |
+| D9 | Task Celery | `@task(bind=True, name="notifications.deliver")`. **Quitar** `max_retries=0`. Ante `RETRY`: `raise self.retry(countdown=..., max_retries=max_delivery_attempts - 1)`. Payload sigue siendo el UUID en string. |
+| D10 | DLQ | Cola Kombu **`notifications.dlq`**. Task `notifications.dead_letter` (`record_dead_letter`): **solo log** `notification_dead_lettered` + el id. No llama al provider. No transiciona estado (la fila **ya** es `FAILED`). Publicar con `apply_async(args=[str(id)], queue="notifications.dlq")`. Broker Redis **no** tiene DLX de AMQP: la DLQ es una cola nombrada, no magia del broker. |
+| D11 | Worker escucha las dos colas | Arranque: `--queues=notifications,notifications.dlq`. Así el demo local enseña la línea de log. Postgres `FAILED` es la **fuente de verdad**. Si el proceso muere entre el commit `FAILED` y el publish DLQ, el mensaje DLQ puede faltar; no añadas columna `dead_lettered_at`. |
+| D12 | Simulado determinista | Template **exacto** `fail-transient` → `TransientProviderError`. Template **exacto** `fail-permanent` → `PermanentProviderError`. Cualquier otro template (p. ej. `welcome`) sigue acertando. Cero `random`. Cero `time.sleep`. Ejemplo curl: `"template":"fail-transient"` para ver reintentos. |
+| D13 | HTTP intacto | Routers, 202, Token Bucket, auth, metrics, health: **no cambian**. `POST /send` no espera al backoff. `GET /metrics` sube `failed` **solo** cuando la fila es `FAILED`, no en cada reintento. Tests HTTP siguen con `InMemoryNotificationQueue`. |
+| D14 | Tests | Cero `time.sleep`. Cero worker Celery vivo. Cero `task_always_eager` global. El backoff se **afirma** (countdown=5/15/45), no se espera. Fake provider en unit/integration. Cero Twilio. |
+| D15 | Settings | `max_delivery_attempts: int = 5` (`ge=1`). `delivery_retry_countdowns: tuple[int, ...] = (5, 15, 45)` desde env CSV. Vacío o enteros `< 1` → `ValidationError` (fail-fast). Siguen obligatorios `SECRET_KEY`, `DATABASE_URL`, `REDIS_URL`, `CELERY_BROKER_URL`. |
+| D16 | Cero libs nuevas | Celery ya está. Prohibido Flower, celery-redbeat, `kombu` extra, Twilio, `httpx` de más, Kafka, JWT. |
+| D17 | Logs | Eventos nuevos: `notification_retry_scheduled`, `notification_dead_lettered`. Los de Fase 9 se quedan. `extra=` con `notification_id`, `client_id`, `channel`, `status`, `retry_count`. Nunca API key ni payload completo ni recipient entero. |
+| D18 | Fuera de esta fase | Celery Beat, UI de replay, mapper HTTP de `InvalidStatusTransition`, `ClientService`, cablear `Client.rate_limit_per_minute`, Mailtrap/Twilio, Dockerfile/Compose, result backend Redis, eager por defecto. |
+| D19 | Git | Rama `feat/phase-10-retries-dlq` **desde** `feat/phase-9-celery-worker` (`a602b2b`). **No** desde `origin/main` (`03c28d6`, sin worker) ni `main` local (`7a2b828`). Commits **solo si EsrgaN lo pide**. |
+| D20 | Docker / extras | Prohibidos. No Kafka, JWT, Prisma, Compose, segundo Redis, segundo broker. |
 
 ---
 
@@ -53,66 +50,56 @@
 
 Archivos reales, no memoria:
 
-1. [`docs/STATUS.md`](docs/STATUS.md) marca Fases 1–8 hechas. [`AGENTS.md`](AGENTS.md) §10.1 siguiente número libre = **9 Worker**. No saltar a retries/DLQ (10): no hay nada que reintentar si nadie despacha. No saltar a README polish (11) ni Compose (12).
-2. [`app/services/queue.py`](app/services/queue.py) es un Protocol + lista en RAM. El docstring ya dice que Celery entra en una fase posterior. [`app/main.py`](app/main.py) asigna `InMemoryNotificationQueue()` siempre. [`NotificationService.accept`](app/services/notification_service.py) hace `commit` y luego `enqueue(id)` — el puerto ya está listo para cambiar de adapter.
-3. [`app/workers/`](app/workers/__init__.py) y [`app/providers/`](app/providers/__init__.py) son stubs de Fase 1. Cero tasks. Cero `NotificationProvider`.
-4. [`app/domain/state_machine.py`](app/domain/state_machine.py) ya prohíbe `PENDING → SENT`. El worker **debe** persistir `PROCESSING`. [`InvalidStatusTransition`](app/domain/exceptions.py) aún no tiene mapper HTTP; el worker no es HTTP.
-5. [`NotificationRepository`](app/repositories/notification_repository.py) no tiene `get_by_id` sin `client_id`. El worker no es un cliente con API key.
-6. [`pyproject.toml`](pyproject.toml) no lista `celery`. `import celery` falla en el venv.
-7. Ejemplo de uso: `POST /send` → 202 `{status: PENDING}`. Sin worker, `GET /status` se queda `PENDING` para siempre (hoy). Con worker: el mismo `GET /status` pasa a `SENT` y `GET /metrics` muestra `sent: 1`. FastAPI **no** espera al email.
+1. [`docs/STATUS.md`](docs/STATUS.md) marca Fases 1–9 hechas. [`AGENTS.md`](AGENTS.md) §10.1 siguiente número libre = **10 Retry + DLQ**. No saltar a README polish (11) ni Compose (12): el worker ya despacha el camino feliz, pero un Mailtrap caído **quema** el ticket a `FAILED` en el primer golpe ([`app/services/dispatch.py`](app/services/dispatch.py) líneas 77–96).
+2. [`app/workers/tasks.py`](app/workers/tasks.py) tiene `max_retries=0`. [`app/workers/celery_app.py`](app/workers/celery_app.py) declara **solo** `Queue("notifications")`. Cero `notifications.dlq`.
+3. [`app/providers/port.py`](app/providers/port.py) solo tiene `ProviderError`. [`app/providers/simulated.py`](app/providers/simulated.py) **nunca** lanza: no hay demo local de retry.
+4. [`app/domain/state_machine.py`](app/domain/state_machine.py) **ya** permite `PROCESSING → PENDING`. [`Notification.retry_count`](app/models/notification.py) **ya** existe (default 0). Cero migración.
+5. [`app/core/config.py`](app/core/config.py) no tiene presupuesto ni countdowns: hoy el `5` viviría como magia en la task, y `AGENTS.md` §5.6 lo prohíbe.
+6. Ejemplo de uso: `POST /send` con `"template":"welcome"` → 202 → worker → `SENT` (igual que Fase 9). Con `"template":"fail-transient"` → el worker espera 5 s, 15 s, 45 s, 45 s; al 5.º fallo `GET /status` = `FAILED` y el log muestra `notification_dead_lettered`. FastAPI **no** espera esos segundos.
 
 ---
 
 ## 2. Árbol al cerrar esta fase
 
 ```text
-pyproject.toml                                 # EDITAR: celery[redis] runtime
-.env.example                                   # EDITAR: CELERY_BROKER_URL
-app/core/config.py                             # EDITAR: celery_broker_url
-app/services/queue.py                          # EDITAR: CeleryNotificationQueue; InMemory se queda
-app/services/dispatch.py                       # NUEVO: DispatchService
-app/services/__init__.py                       # EDITAR: export DispatchService + CeleryNotificationQueue
-app/repositories/notification_repository.py    # EDITAR: get_by_id
-app/providers/__init__.py                      # EDITAR: docstring + exports
-app/providers/port.py                          # NUEVO: OutboundMessage, ProviderError, Protocol
-app/providers/simulated.py                     # NUEVO: SimulatedNotificationProvider
-app/workers/__init__.py                        # EDITAR: docstring
-app/workers/celery_app.py                      # NUEVO: Celery app + conf
-app/workers/runtime.py                         # NUEVO: engine/session del worker
-app/workers/tasks.py                           # NUEVO: deliver_notification(id: str)
-app/main.py                                    # EDITAR: lifespan elige InMemory vs Celery queue
-app/api/routers/notifications.py               # EDITAR: docstring (el router sigue sin enviar)
-tests/conftest.py                              # EDITAR: CELERY_BROKER_URL en el env de pytest
-tests/unit/test_config.py                      # EDITAR: fail-fast CELERY_BROKER_URL
-tests/unit/test_queue.py                       # no tocar (InMemory sigue)
-tests/unit/test_celery_queue.py                # NUEVO: apply_async + QueueUnavailableError
-tests/unit/providers/test_simulated.py         # NUEVO: simulado no hace I/O
-tests/unit/services/test_dispatch_service.py   # NUEVO: SENT / skip / FAILED / missing
-tests/integration/test_notification_repository.py  # EDITAR: get_by_id
-tests/integration/test_dispatch.py             # NUEVO: Postgres real PENDING → SENT
-README.md                                      # EDITAR: segundo proceso celery + curl status SENT
-docs/STATUS.md                                 # EDITAR en el último paso de implementación
+.env.example                                      # EDITAR: MAX_DELIVERY_ATTEMPTS + DELIVERY_RETRY_COUNTDOWNS
+app/core/config.py                                # EDITAR: esos dos campos + validator CSV
+app/domain/retry_policy.py                        # NUEVO: DeliveryRetryPolicy
+app/domain/__init__.py                            # EDITAR: export
+app/providers/port.py                             # EDITAR: TransientProviderError, PermanentProviderError
+app/providers/simulated.py                        # EDITAR: fail-transient / fail-permanent
+app/providers/__init__.py                         # EDITAR: export subclasses
+app/services/dispatch.py                          # EDITAR: policy + DispatchResult; ya no FAILED inmediato
+app/workers/celery_app.py                         # EDITAR: Queue("notifications.dlq")
+app/workers/tasks.py                              # EDITAR: bind=True, retry, record_dead_letter, apply_delivery_result
+app/workers/__init__.py                           # EDITAR: docstring (retries + DLQ)
+README.md                                         # EDITAR: backoff, templates de fallo, --queues con dlq
+docs/STATUS.md                                    # EDITAR en el último paso de *implementación* (otro turno)
+tests/unit/test_config.py                         # EDITAR: defaults + CSV inválido
+tests/unit/domain/test_retry_policy.py            # NUEVO
+tests/unit/providers/test_simulated.py            # EDITAR: templates de fallo
+tests/unit/services/test_dispatch_service.py      # EDITAR: retry / permanente / agotado
+tests/unit/workers/test_apply_delivery_result.py  # NUEVO
+tests/integration/test_dispatch.py                # EDITAR: transiente→SENT; permanente→FAILED
 ```
 
-**No crear:** `Dockerfile`, `docker-compose.yml`, revisión Alembic, `app/workers/beat.py`, `notifications.dlq`, `BackgroundTasks`, `app/providers/twilio.py`, result backend.
+**No crear:** `Dockerfile`, `docker-compose.yml`, revisión Alembic, `app/workers/beat.py`, `app/providers/twilio.py`, `BackgroundTasks`, result backend, columna `dead_lettered_at`.
 
-**No tocar:** máquina de estados (tabla ya correcta), modelos/columnas, `GET /health`, Token Bucket / middleware 429, `NotificationService.accept` / `get_status`, `MetricsService`, `hash_api_key`, `create_all`, routers de metrics/clients más allá del docstring de notifications, `AuthenticatedClient`.
+**No tocar:** máquina de estados (la arista de retry **ya** está), modelos/columnas, `GET /health`, Token Bucket, `NotificationService.accept` / `get_status`, `MetricsService`, `hash_api_key`, routers (ni siquiera el docstring salvo si mientes), `CeleryNotificationQueue` (sigue publicando solo a `notifications`), `create_all`.
 
 ---
 
 ## 3. Git
 
-Fase 8 **ya** está en `origin/main` (`03c28d6`, mismo árbol que `ea4da85`). Crear la rama así:
+Phase 9 vive **solo** en `feat/phase-9-celery-worker` (`a602b2b`). Crear la rama así:
 
 ```bash
-git checkout origin/main
-# HEAD esperado: 03c28d6
-git checkout -b feat/phase-9-celery-worker
+git checkout feat/phase-9-celery-worker
+# HEAD esperado: a602b2b
+git checkout -b feat/phase-10-retries-dlq
 ```
 
-Equivalente válido: `git checkout feat/phase-8-token-bucket && git checkout -b feat/phase-9-celery-worker` (árbol idéntico).
-
-**Nunca** partir de `main` local (`7a2b828`). **Nunca** commitear en `main`.
+**Nunca** partir de `origin/main` (`03c28d6`: no hay worker) ni de `main` local (`7a2b828`). **Nunca** commitear en `main`.
 
 Antes de cerrar cada paso de código:
 
@@ -120,39 +107,27 @@ Antes de cerrar cada paso de código:
 source .venv/bin/activate
 pytest -q
 ruff check app tests
+mypy app
 ```
 
-Los 90 tests de Fases 2–8 deben seguir verdes (más los nuevos de esta fase).
+Los 105 tests de Fases 2–9 deben seguir verdes **después** de adaptar los de dispatch que hoy esperan `FAILED` inmediato ante `ProviderError` (paso 10.3). No dejes ese rojo “para después”.
 
 ---
 
 ## FASE 0 — Preparación
 
-- [ ] `pytest -q` → 90 passed **antes** de editar
-- [ ] `ruff check app tests` limpio
-- [ ] Rama `feat/phase-9-celery-worker` creada desde `origin/main` (`03c28d6`)
-- [ ] Redis local ya corre (Fase 8): `redis-cli ping` → `PONG`. No hace falta un segundo servidor. El índice `/1` existe solo con `SELECT 1`.
-- [ ] Cero Docker, cero Beat, cero Twilio, cero `BackgroundTasks`
-- [ ] Enseñar a EsrgaN (ejemplo): **Celery** es un cocinero en la trastienda. FastAPI es el mostrador: toma el pedido, lo anota en un ticket (Postgres `PENDING`) y lo clava en un rail (Redis índice 1). El mostrador **no** cocina. El cocinero lee el ticket, pone “en preparación” (`PROCESSING`), cocina de mentira (provider simulado) y marca “listo” (`SENT`). Si el mostrador cocinara (`BackgroundTasks` o Twilio dentro del `POST`), un cliente lento o un uvicorn reiniciado quemaría el email a medias. **Worker** = ese proceso cocinero. **Broker** = el rail de tickets. **Provider** = la cocina (hoy de cartón; mañana Twilio detrás del mismo enchufe).
+- [ ] `pytest -q` → 105 passed **antes** de editar
+- [ ] `ruff check app tests` limpio; `mypy app` limpio
+- [ ] Rama `feat/phase-10-retries-dlq` creada desde `feat/phase-9-celery-worker` (`a602b2b`)
+- [ ] Redis local ya corre (Fases 8–9). No hace falta un segundo servidor.
+- [ ] Cero Docker, cero Beat, cero Twilio, cero `BackgroundTasks`, cero Alembic
+- [ ] Enseñar a EsrgaN (ejemplo): **Retry** = si el horno está ocupado, el ticket vuelve al rail y el cocinero lo retoma. **Backoff** = no golpear la puerta a cada segundo: espera 5 s, luego 15 s, luego 45 s. **Fallo permanente** = la dirección no existe; esperar no la inventa. **DLQ** (*Dead Letter Queue*) = cajón de tickets rotos para **mirarlos**, no una UI de reenvío. **Celery `self.retry`** = “vuelve a ponerme este mismo ticket en el rail dentro de N segundos”. El mostrador FastAPI **nunca** espera esos N segundos: el cliente ya tiene el `202` y el `notification_id`.
 
 ---
 
-## FASE 9 — Celery + provider simulado
+## FASE 10 — Retries + DLQ
 
-### Paso 9.1 — Settings + dependencia `celery`
-
-Editar [`pyproject.toml`](pyproject.toml). Añadir a `dependencies` (junto a `redis`, **no** en dev):
-
-```toml
-    "celery[redis]>=5.4,<6",
-```
-
-Instalar en el venv:
-
-```bash
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-```
+### Paso 10.1 — Settings + política de dominio
 
 Editar [`.env.example`](.env.example) — el archivo completo queda:
 
@@ -165,11 +140,13 @@ DATABASE_URL=postgresql+psycopg://USER@localhost:5432/notifications_engine
 REDIS_URL=redis://localhost:6379/0
 CELERY_BROKER_URL=redis://localhost:6379/1
 RATE_LIMIT_PER_MINUTE=10
+MAX_DELIVERY_ATTEMPTS=5
+DELIVERY_RETRY_COUNTDOWNS=5,15,45
 ```
 
-Quien ya tenga `.env` debe copiar `CELERY_BROKER_URL` a mano (no commitear `.env`).
+Quien ya tenga `.env` debe copiar las dos líneas nuevas a mano (no commitear `.env`). Los **defaults** en `Settings` coinciden, así que un `.env` viejo sigue arrancando.
 
-Editar [`app/core/config.py`](app/core/config.py). El archivo queda así (completo):
+Editar [`app/core/config.py`](app/core/config.py). Añadir los campos **después** de `rate_limit_per_minute` y los validators **después** de `require_celery_broker_url`. El archivo completo queda:
 
 ```python
 """Application settings loaded from the environment.
@@ -205,6 +182,8 @@ class Settings(BaseSettings):
     redis_url: SecretStr = Field(min_length=1)
     celery_broker_url: SecretStr = Field(min_length=1)
     rate_limit_per_minute: int = Field(default=10, ge=1)
+    max_delivery_attempts: int = Field(default=5, ge=1)
+    delivery_retry_countdowns: tuple[int, ...] = Field(default=(5, 15, 45))
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -244,74 +223,212 @@ class Settings(BaseSettings):
             raise ValueError("CELERY_BROKER_URL must start with 'redis://'")
         return value
 
+    @field_validator("delivery_retry_countdowns", mode="before")
+    @classmethod
+    def parse_retry_countdowns(cls, value: object) -> object:
+        """Accept CSV from env (5,15,45) or an already-parsed sequence."""
+        if isinstance(value, str):
+            parts = tuple(int(piece.strip()) for piece in value.split(",") if piece.strip())
+            return parts
+        return value
+
+    @field_validator("delivery_retry_countdowns")
+    @classmethod
+    def require_positive_countdowns(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        """Empty or non-positive waits are not a backoff schedule."""
+        if not value or any(seconds < 1 for seconds in value):
+            raise ValueError(
+                "DELIVERY_RETRY_COUNTDOWNS must be a comma-separated list of integers >= 1"
+            )
+        return value
+
 
 @lru_cache
 def get_settings() -> Settings:
     """Cached settings so every request does not re-read the environment."""
-    return Settings()
+    return Settings()  # type: ignore[call-arg]
 ```
 
-Editar [`tests/conftest.py`](tests/conftest.py): después de `REDIS_URL`, **antes** de importar `app.main`:
+Crear [`app/domain/retry_policy.py`](app/domain/retry_policy.py). Responsabilidad: presupuesto y espera. Quién lo llama: `DispatchService`. **No** Celery, **no** FastAPI.
 
 ```python
-os.environ.setdefault("CELERY_BROKER_URL", "redis://localhost:6379/1")
+"""Attempt budget and backoff. Numbers come from settings; this module is stdlib-only."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class DeliveryRetryPolicy:
+    """How many sends are allowed and how long to wait after each transient failure."""
+
+    max_attempts: int
+    countdown_seconds: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if not self.countdown_seconds or any(seconds < 1 for seconds in self.countdown_seconds):
+            raise ValueError("countdown_seconds must be a non-empty tuple of ints >= 1")
+
+    def should_retry(self, retry_count: int, *, retryable: bool) -> bool:
+        """``retry_count`` is attempts already burned, including the failure just counted."""
+        return retryable and retry_count < self.max_attempts
+
+    def countdown_for(self, retry_count: int) -> int:
+        """Seconds to wait after this failed attempt. Extra attempts cap at the last slot."""
+        if retry_count < 1:
+            raise ValueError("retry_count must be >= 1 when asking for a countdown")
+        index = min(retry_count - 1, len(self.countdown_seconds) - 1)
+        return self.countdown_seconds[index]
 ```
 
-Editar [`tests/unit/test_config.py`](tests/unit/test_config.py): extrae `_TEST_CELERY_BROKER_URL = "redis://localhost:6379/1"` y **añádelo** a cada test existente que construye `Settings(_env_file=None)` (si no, el fail-fast nuevo los rompe). Añade:
+Editar [`app/domain/__init__.py`](app/domain/__init__.py):
 
 ```python
-_TEST_CELERY_BROKER_URL = "redis://localhost:6379/1"
+"""Domain layer: channels, statuses, transitions, and named errors.
+
+This package must not import FastAPI, Pydantic, SQLAlchemy, Redis, or Celery.
+"""
+
+from app.domain.enums import Channel, NotificationStatus
+from app.domain.exceptions import DomainError, InvalidStatusTransition, NotificationNotFound
+from app.domain.retry_policy import DeliveryRetryPolicy
+from app.domain.state_machine import assert_transition, can_transition, transition
+
+__all__ = [
+    "Channel",
+    "DeliveryRetryPolicy",
+    "DomainError",
+    "InvalidStatusTransition",
+    "NotificationNotFound",
+    "NotificationStatus",
+    "assert_transition",
+    "can_transition",
+    "transition",
+]
+```
+
+Crear [`tests/unit/domain/test_retry_policy.py`](tests/unit/domain/test_retry_policy.py):
+
+```python
+import pytest
+
+from app.domain.retry_policy import DeliveryRetryPolicy
+
+_POLICY = DeliveryRetryPolicy(max_attempts=5, countdown_seconds=(5, 15, 45))
 
 
-def test_missing_celery_broker_url_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
-    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
-    monkeypatch.setenv("REDIS_URL", _TEST_REDIS_URL)
-    monkeypatch.delenv("CELERY_BROKER_URL", raising=False)
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None)
+def test_first_three_failures_use_schedule_then_cap() -> None:
+    assert _POLICY.countdown_for(1) == 5
+    assert _POLICY.countdown_for(2) == 15
+    assert _POLICY.countdown_for(3) == 45
+    assert _POLICY.countdown_for(4) == 45
 
 
-def test_celery_broker_url_without_redis_prefix_fails(
+def test_retry_while_budget_remains() -> None:
+    assert _POLICY.should_retry(1, retryable=True) is True
+    assert _POLICY.should_retry(4, retryable=True) is True
+    assert _POLICY.should_retry(5, retryable=True) is False
+
+
+def test_permanent_failure_never_retries() -> None:
+    assert _POLICY.should_retry(1, retryable=False) is False
+
+
+def test_single_attempt_budget_fails_fast() -> None:
+    policy = DeliveryRetryPolicy(max_attempts=1, countdown_seconds=(5, 15, 45))
+    assert policy.should_retry(1, retryable=True) is False
+
+
+def test_invalid_policy_rejected() -> None:
+    with pytest.raises(ValueError):
+        DeliveryRetryPolicy(max_attempts=0, countdown_seconds=(5,))
+    with pytest.raises(ValueError):
+        DeliveryRetryPolicy(max_attempts=5, countdown_seconds=())
+    with pytest.raises(ValueError):
+        DeliveryRetryPolicy(max_attempts=5, countdown_seconds=(5, 0))
+```
+
+Editar [`tests/unit/test_config.py`](tests/unit/test_config.py). Añadir al final (los tests viejos siguen válidos: hay default):
+
+```python
+def test_delivery_retry_settings_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
     monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
     monkeypatch.setenv("REDIS_URL", _TEST_REDIS_URL)
-    monkeypatch.setenv("CELERY_BROKER_URL", "amqp://localhost")
+    monkeypatch.setenv("CELERY_BROKER_URL", _TEST_CELERY_BROKER_URL)
+    monkeypatch.delenv("MAX_DELIVERY_ATTEMPTS", raising=False)
+    monkeypatch.delenv("DELIVERY_RETRY_COUNTDOWNS", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.max_delivery_attempts == 5
+    assert settings.delivery_retry_countdowns == (5, 15, 45)
+
+
+def test_delivery_retry_countdowns_parse_csv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", _TEST_REDIS_URL)
+    monkeypatch.setenv("CELERY_BROKER_URL", _TEST_CELERY_BROKER_URL)
+    monkeypatch.setenv("DELIVERY_RETRY_COUNTDOWNS", "5,15,45")
+    settings = Settings(_env_file=None)
+    assert settings.delivery_retry_countdowns == (5, 15, 45)
+
+
+def test_delivery_retry_countdowns_reject_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", _TEST_REDIS_URL)
+    monkeypatch.setenv("CELERY_BROKER_URL", _TEST_CELERY_BROKER_URL)
+    monkeypatch.setenv("DELIVERY_RETRY_COUNTDOWNS", "5,0,45")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_max_delivery_attempts_below_one_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECRET_KEY", "pytest-secret-key")
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", _TEST_REDIS_URL)
+    monkeypatch.setenv("CELERY_BROKER_URL", _TEST_CELERY_BROKER_URL)
+    monkeypatch.setenv("MAX_DELIVERY_ATTEMPTS", "0")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 ```
 
-`test_valid_secret_key_is_not_in_repr` debe setear `CELERY_BROKER_URL`. `celery_broker_url` es `SecretStr`.
-
-[`tests/unit/test_logging.py`](tests/unit/test_logging.py) usa `Settings(_env_file=None)` y se apoya en el env de `conftest`; con el `setdefault` basta. No lo reescribas salvo que pytest lo rompa.
-
-- **Patrón:** fail-fast configuration (`pydantic-settings`).
-- **Por qué ahora:** esta fase **abre** el broker. El playbook prohibía exigir URLs *antes* de abrirlas; ya no aplica.
-- **Alternativa descartada:** derivar `/1` desde `REDIS_URL` con un replace. Un typo dejaría cubo y broker en el mismo índice y nadie lo vería en el `.env`. URL explícita enseña “dos usos, dos sitios”.
-- **Capa:** `app/core/`. No importa FastAPI ni Celery.
+- **Patrón:** fail-fast configuration + regla de dominio pura (sin Celery).
+- **Por qué ahora:** esta fase **abre** el presupuesto. Si el `5` y el `45` viven en `tasks.py`, no puedes enseñar “config vs magia” y un test no puede usar `max_attempts=2` sin parchear el módulo.
+- **Alternativa descartada:** 5 s → 15 s → 45 s → **135 s** (seguir el ×3). En un demo local parece un hang; `AGENTS.md` §5.6 permite tope. El tope 45 s enseña “exponencial con techo”.
+- **Capa:** `app/core/` (números) + `app/domain/` (regla). Domain no importa Settings.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-chore: require CELERY_BROKER_URL and pin Celery
+feat: configure delivery attempts and backoff in settings
 
-Fail boot without a dedicated Redis index so the worker broker
-cannot silently share the token-bucket database.
+Keep the 5-attempt budget and 5/15/45 schedule out of the
+task module so tests can vary the policy without Celery.
 ```
 
 ---
 
-### Paso 9.2 — Puerto de provider + simulado
+### Paso 10.2 — Errores de provider + simulado determinista
 
-Crear [`app/providers/port.py`](app/providers/port.py). Responsabilidad: el enchufe. Quién lo implementa: adapters. Quién lo llama: `DispatchService`. **No** HTTP, **no** Celery.
+Editar [`app/providers/port.py`](app/providers/port.py). El archivo completo queda:
 
 ```python
 """Application-owned provider port.
 
-Workers call this; routers must not. Retry policy lives in the worker (later),
-not inside an adapter.
+Workers call this; routers must not. Retry policy lives in DispatchService
+and the worker task, not inside an adapter.
 """
 
 from __future__ import annotations
@@ -323,7 +440,15 @@ from app.domain.enums import Channel
 
 
 class ProviderError(Exception):
-    """The channel adapter could not deliver. Dispatch maps this to FAILED."""
+    """The channel adapter could not deliver. Unclassified errors are retryable."""
+
+
+class TransientProviderError(ProviderError):
+    """Timeout / 5xx-equivalent. Dispatch may retry with backoff."""
+
+
+class PermanentProviderError(ProviderError):
+    """Bad recipient / 4xx-equivalent. Dispatch marks FAILED without backoff."""
 
 
 @dataclass(frozen=True)
@@ -344,7 +469,7 @@ class NotificationProvider(Protocol):
         ...
 ```
 
-Crear [`app/providers/simulated.py`](app/providers/simulated.py):
+Editar [`app/providers/simulated.py`](app/providers/simulated.py). El archivo completo queda:
 
 ```python
 """In-process adapter. Logs a send; never talks to a vendor."""
@@ -353,15 +478,26 @@ from __future__ import annotations
 
 import logging
 
-from app.providers.port import OutboundMessage
+from app.providers.port import (
+    OutboundMessage,
+    PermanentProviderError,
+    TransientProviderError,
+)
 
 logger = logging.getLogger("app.providers.simulated")
 
+_TRANSIENT_FAIL_TEMPLATE = "fail-transient"
+_PERMANENT_FAIL_TEMPLATE = "fail-permanent"
+
 
 class SimulatedNotificationProvider:
-    """v1 channel adapter: always succeeds, no network."""
+    """v1 channel adapter: succeeds unless the template is an exact fail switch."""
 
     def send(self, message: OutboundMessage) -> None:
+        if message.template == _PERMANENT_FAIL_TEMPLATE:
+            raise PermanentProviderError("simulated permanent failure")
+        if message.template == _TRANSIENT_FAIL_TEMPLATE:
+            raise TransientProviderError("simulated transient failure")
         logger.info(
             "simulated_send",
             extra={
@@ -371,42 +507,55 @@ class SimulatedNotificationProvider:
         )
 ```
 
-No loguees `recipient` completo (PII). No `time.sleep`. No `random` para fallar “a veces” (eso es Fase 10 y ensuciaría el demo local).
-
 Editar [`app/providers/__init__.py`](app/providers/__init__.py):
 
 ```python
 """Channel provider adapters. v1 ships a simulated adapter behind the port."""
 
-from app.providers.port import NotificationProvider, OutboundMessage, ProviderError
+from app.providers.port import (
+    NotificationProvider,
+    OutboundMessage,
+    PermanentProviderError,
+    ProviderError,
+    TransientProviderError,
+)
 from app.providers.simulated import SimulatedNotificationProvider
 
 __all__ = [
     "NotificationProvider",
     "OutboundMessage",
+    "PermanentProviderError",
     "ProviderError",
     "SimulatedNotificationProvider",
+    "TransientProviderError",
 ]
 ```
 
-Crear [`tests/unit/providers/test_simulated.py`](tests/unit/providers/test_simulated.py):
+Editar [`tests/unit/providers/test_simulated.py`](tests/unit/providers/test_simulated.py). El archivo completo queda:
 
 ```python
+import pytest
+
 from app.domain.enums import Channel
-from app.providers.port import OutboundMessage
+from app.providers.port import (
+    OutboundMessage,
+    PermanentProviderError,
+    TransientProviderError,
+)
 from app.providers.simulated import SimulatedNotificationProvider
 
 
-def test_simulated_send_returns_without_raising() -> None:
-    provider = SimulatedNotificationProvider()
-    provider.send(
-        OutboundMessage(
-            channel=Channel.EMAIL,
-            recipient="user@example.com",
-            template="welcome",
-            payload={"name": "Ada"},
-        )
+def _message(template: str) -> OutboundMessage:
+    return OutboundMessage(
+        channel=Channel.EMAIL,
+        recipient="user@example.com",
+        template=template,
+        payload={"name": "Ada"},
     )
+
+
+def test_simulated_send_returns_without_raising() -> None:
+    SimulatedNotificationProvider().send(_message("welcome"))
 
 
 def test_simulated_send_accepts_every_channel() -> None:
@@ -420,58 +569,43 @@ def test_simulated_send_accepts_every_channel() -> None:
                 payload={},
             )
         )
+
+
+def test_fail_transient_template_raises_transient() -> None:
+    with pytest.raises(TransientProviderError):
+        SimulatedNotificationProvider().send(_message("fail-transient"))
+
+
+def test_fail_permanent_template_raises_permanent() -> None:
+    with pytest.raises(PermanentProviderError):
+        SimulatedNotificationProvider().send(_message("fail-permanent"))
+
+
+def test_fail_prefix_is_not_enough() -> None:
+    SimulatedNotificationProvider().send(_message("fail-transient-welcome"))
 ```
 
 Cero sockets. Cero Twilio. Cero FastAPI.
 
-- **Patrón:** puerto / adapter (hexagonal). El dominio no conoce Twilio; el worker tampoco importa un SDK.
-- **Por qué simulado ahora:** ejemplo: sin este enchufe, el worker haría `import twilio` y mañana cambiar de vendor reescribe la task. Con el puerto, Fase 10–12 enchufan Mailtrap detrás de la misma firma.
-- **Alternativa descartada:** llamar a un SMTP local en esta fase. Enseña red, no el puerto; y los tests dejarían de ser unitarios.
-- **Capa:** `app/providers/`. Puede usar dominio (`Channel`). No puede importar `app.api` ni `app.workers`.
+- **Patrón:** puerto / adapter. El adapter **clasifica** el fallo; **no** decide el backoff.
+- **Por qué templates exactos:** ejemplo: en curl pones `"template":"fail-transient"` y ves reintentos sin tocar código. Un `random` haría el demo irreproducible (Fase 9 lo prohibió por eso).
+- **Alternativa descartada:** setting `SIMULATED_FAIL_MODE`. Enseñaría config, no el puerto; y cada test pelearía con el env global.
+- **Capa:** `app/providers/`. Puede usar dominio (`Channel`). No puede importar `app.workers` ni `app.api`.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-feat: add a simulated notification provider port
+feat: distinguish transient and permanent provider errors
 
-Keep vendor I/O behind a protocol so the worker never imports
-a channel SDK.
+Let the simulated adapter fail on exact templates so retries
+can be demoed without a vendor SDK.
 ```
 
 ---
 
-### Paso 9.3 — `get_by_id` + `DispatchService`
+### Paso 10.3 — `DispatchService` reintenta o falla
 
-Editar [`app/repositories/notification_repository.py`](app/repositories/notification_repository.py). Añadir **después** de `get_by_id_for_client`:
-
-```python
-    def get_by_id(self, notification_id: uuid.UUID) -> Notification | None:
-        """Load by primary key. Worker path only; not an HTTP authorization check."""
-        return self._session.get(Notification, notification_id)
-```
-
-Editar [`tests/integration/test_notification_repository.py`](tests/integration/test_notification_repository.py). Añadir:
-
-```python
-def test_get_by_id_returns_row_without_client_filter(db_session: Session) -> None:
-    owner = _client(db_session)
-    repo = NotificationRepository(db_session)
-    row = repo.create(
-        client_id=owner.id,
-        channel=Channel.EMAIL,
-        recipient="user@example.com",
-        template="welcome",
-        payload={},
-        idempotency_key=None,
-    )
-    db_session.flush()
-    loaded = repo.get_by_id(row.id)
-    assert loaded is not None
-    assert loaded.id == row.id
-    assert repo.get_by_id(uuid.uuid4()) is None
-```
-
-Crear [`app/services/dispatch.py`](app/services/dispatch.py). Responsabilidad: transicionar y llamar al puerto. Quién lo llama: la task Celery. **No** FastAPI.
+Editar [`app/services/dispatch.py`](app/services/dispatch.py). El archivo completo queda:
 
 ```python
 """Use case: dispatch one persisted notification through a provider port."""
@@ -480,13 +614,21 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 
 from sqlalchemy.orm import Session
 
 from app.domain.enums import NotificationStatus
+from app.domain.retry_policy import DeliveryRetryPolicy
 from app.domain.state_machine import assert_transition
-from app.providers.port import OutboundMessage, ProviderError
+from app.models.notification import Notification
+from app.providers.port import (
+    NotificationProvider,
+    OutboundMessage,
+    PermanentProviderError,
+)
 from app.repositories.notification_repository import NotificationRepository
 
 logger = logging.getLogger("app.dispatch")
@@ -494,26 +636,45 @@ logger = logging.getLogger("app.dispatch")
 _ERROR_MESSAGE_MAX = 512
 
 
+class DispatchAction(StrEnum):
+    SENT = "sent"
+    SKIPPED = "skipped"
+    MISSING = "missing"
+    RETRY = "retry"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class DispatchResult:
+    """What the worker task should do after this attempt. No Celery types here."""
+
+    action: DispatchAction
+    countdown_seconds: int | None = None
+    dead_letter: bool = False
+
+
 class DispatchService:
     def __init__(
         self,
         session: Session,
         repository: NotificationRepository,
-        provider: object,
+        provider: NotificationProvider,
+        policy: DeliveryRetryPolicy,
     ) -> None:
         self._session = session
         self._repository = repository
         self._provider = provider
+        self._policy = policy
 
-    def dispatch(self, notification_id: uuid.UUID) -> None:
-        """Load, skip terminals, PROCESSING → provider → SENT or FAILED. Commits here."""
+    def dispatch(self, notification_id: uuid.UUID) -> DispatchResult:
+        """Load, skip terminals, PROCESSING → provider → SENT, RETRY, or FAILED. Commits here."""
         row = self._repository.get_by_id(notification_id)
         if row is None:
             logger.warning(
                 "notification_dispatch_missing",
                 extra={"notification_id": str(notification_id)},
             )
-            return
+            return DispatchResult(DispatchAction.MISSING)
 
         if row.status in {NotificationStatus.SENT, NotificationStatus.FAILED}:
             logger.info(
@@ -526,7 +687,7 @@ class DispatchService:
                     "retry_count": row.retry_count,
                 },
             )
-            return
+            return DispatchResult(DispatchAction.SKIPPED)
 
         if row.status is NotificationStatus.PENDING:
             assert_transition(row.status, NotificationStatus.PROCESSING)
@@ -553,23 +714,7 @@ class DispatchService:
         try:
             self._provider.send(message)
         except Exception as exc:
-            error = exc if isinstance(exc, ProviderError) else ProviderError(str(exc))
-            assert_transition(row.status, NotificationStatus.FAILED)
-            row.status = NotificationStatus.FAILED
-            row.error_message = str(error)[:_ERROR_MESSAGE_MAX]
-            self._session.commit()
-            logger.info(
-                "notification_dispatch_failed",
-                extra={
-                    "notification_id": str(row.id),
-                    "client_id": str(row.client_id),
-                    "channel": row.channel.value,
-                    "status": row.status.value,
-                    "retry_count": row.retry_count,
-                },
-                exc_info=True,
-            )
-            return
+            return self._handle_send_failure(row, exc)
 
         assert_transition(row.status, NotificationStatus.SENT)
         row.status = NotificationStatus.SENT
@@ -586,32 +731,57 @@ class DispatchService:
                 "retry_count": row.retry_count,
             },
         )
+        return DispatchResult(DispatchAction.SENT)
+
+    def _handle_send_failure(self, row: Notification, exc: Exception) -> DispatchResult:
+        retryable = not isinstance(exc, PermanentProviderError)
+        row.retry_count += 1
+        row.error_message = str(exc)[:_ERROR_MESSAGE_MAX]
+        extras = {
+            "notification_id": str(row.id),
+            "client_id": str(row.client_id),
+            "channel": row.channel.value,
+            "status": row.status.value,
+            "retry_count": row.retry_count,
+        }
+
+        if self._policy.should_retry(row.retry_count, retryable=retryable):
+            countdown = self._policy.countdown_for(row.retry_count)
+            assert_transition(row.status, NotificationStatus.PENDING)
+            row.status = NotificationStatus.PENDING
+            self._session.commit()
+            logger.info("notification_retry_scheduled", extra=extras)
+            return DispatchResult(
+                DispatchAction.RETRY,
+                countdown_seconds=countdown,
+            )
+
+        assert_transition(row.status, NotificationStatus.FAILED)
+        row.status = NotificationStatus.FAILED
+        self._session.commit()
+        logger.info("notification_dispatch_failed", extra=extras, exc_info=True)
+        return DispatchResult(DispatchAction.FAILED, dead_letter=True)
 ```
 
-El type de `provider` es `object` a propósito en el hint público si MyPy se queja del Protocol estructural; preferí anotar `NotificationProvider` si MyPy lo acepta sin ignore:
+El service ya devolvía `Notification` vía el repositorio (Fase 9). Importar el modelo aquí es idiomático. **Prohibido** importar `app.models` desde un **router**.
 
-```python
-        provider: NotificationProvider,
-```
-
-Usa `NotificationProvider` (el Protocol). No uses `Any` en la firma pública.
-
-Editar [`app/services/__init__.py`](app/services/__init__.py) para exportar `DispatchService` y `CeleryNotificationQueue` (esta última en el paso 9.4; puedes exportarla entonces).
-
-Crear [`tests/unit/services/test_dispatch_service.py`](tests/unit/services/test_dispatch_service.py):
+Editar [`tests/unit/services/test_dispatch_service.py`](tests/unit/services/test_dispatch_service.py). El archivo completo queda:
 
 ```python
 from __future__ import annotations
 
 import uuid
-from typing import Any
-
-import pytest
 
 from app.domain.enums import Channel, NotificationStatus
+from app.domain.retry_policy import DeliveryRetryPolicy
 from app.models.notification import Notification
-from app.providers.port import OutboundMessage, ProviderError
-from app.services.dispatch import DispatchService
+from app.providers.port import (
+    OutboundMessage,
+    PermanentProviderError,
+    ProviderError,
+    TransientProviderError,
+)
+from app.services.dispatch import DispatchAction, DispatchService
 
 
 class FakeSession:
@@ -640,15 +810,35 @@ class RecordingProvider:
         self.messages.append(message)
 
 
-class BoomProvider:
+class TransientBoomProvider:
+    def send(self, message: OutboundMessage) -> None:
+        raise TransientProviderError("vendor 500")
+
+
+class PermanentBoomProvider:
+    def send(self, message: OutboundMessage) -> None:
+        raise PermanentProviderError("bad recipient")
+
+
+class UnclassifiedBoomProvider:
     def send(self, message: OutboundMessage) -> None:
         raise ProviderError("vendor 500")
+
+
+class CrashProvider:
+    def send(self, message: OutboundMessage) -> None:
+        raise RuntimeError("socket exploded")
+
+
+def _policy(*, max_attempts: int = 5) -> DeliveryRetryPolicy:
+    return DeliveryRetryPolicy(max_attempts=max_attempts, countdown_seconds=(5, 15, 45))
 
 
 def _row(
     *,
     status: NotificationStatus = NotificationStatus.PENDING,
     notification_id: uuid.UUID | None = None,
+    retry_count: int = 0,
 ) -> Notification:
     return Notification(
         id=notification_id or uuid.uuid4(),
@@ -658,33 +848,49 @@ def _row(
         template="welcome",
         payload={"n": 1},
         status=status,
-        retry_count=0,
+        retry_count=retry_count,
     )
+
+
+def _service(
+    row: Notification | None,
+    provider: object,
+    session: FakeSession | None = None,
+    *,
+    max_attempts: int = 5,
+) -> tuple[DispatchService, FakeSession]:
+    sess = session or FakeSession()
+    service = DispatchService(
+        sess,
+        FakeNotificationRepository(row),
+        provider,  # type: ignore[arg-type]
+        _policy(max_attempts=max_attempts),
+    )
+    return service, sess
 
 
 def test_pending_becomes_sent_and_calls_provider_once() -> None:
     row = _row()
-    session = FakeSession()
     provider = RecordingProvider()
-    service = DispatchService(session, FakeNotificationRepository(row), provider)
+    service, session = _service(row, provider)
 
-    service.dispatch(row.id)
+    result = service.dispatch(row.id)
 
+    assert result.action is DispatchAction.SENT
     assert row.status is NotificationStatus.SENT
     assert row.sent_at is not None
     assert session.commit_calls == 2
     assert len(provider.messages) == 1
-    assert provider.messages[0].template == "welcome"
 
 
 def test_already_sent_does_not_call_provider() -> None:
     row = _row(status=NotificationStatus.SENT)
     provider = RecordingProvider()
-    session = FakeSession()
-    service = DispatchService(session, FakeNotificationRepository(row), provider)
+    service, session = _service(row, provider)
 
-    service.dispatch(row.id)
+    result = service.dispatch(row.id)
 
+    assert result.action is DispatchAction.SKIPPED
     assert provider.messages == []
     assert session.commit_calls == 0
     assert row.status is NotificationStatus.SENT
@@ -693,10 +899,11 @@ def test_already_sent_does_not_call_provider() -> None:
 def test_already_failed_does_not_call_provider() -> None:
     row = _row(status=NotificationStatus.FAILED)
     provider = RecordingProvider()
-    service = DispatchService(session, FakeNotificationRepository(row), provider)
+    service, session = _service(row, provider)
 
-    service.dispatch(row.id)
+    result = service.dispatch(row.id)
 
+    assert result.action is DispatchAction.SKIPPED
     assert provider.messages == []
     assert session.commit_calls == 0
 
@@ -704,8 +911,7 @@ def test_already_failed_does_not_call_provider() -> None:
 def test_processing_crash_recovery_sends_without_second_pending_transition() -> None:
     row = _row(status=NotificationStatus.PROCESSING)
     provider = RecordingProvider()
-    session = FakeSession()
-    service = DispatchService(session, FakeNotificationRepository(row), provider)
+    service, session = _service(row, provider)
 
     service.dispatch(row.id)
 
@@ -714,33 +920,95 @@ def test_processing_crash_recovery_sends_without_second_pending_transition() -> 
     assert len(provider.messages) == 1
 
 
-def test_provider_error_marks_failed() -> None:
+def test_transient_error_returns_to_pending_with_countdown() -> None:
     row = _row()
-    session = FakeSession()
-    service = DispatchService(session, FakeNotificationRepository(row), BoomProvider())
+    service, session = _service(row, TransientBoomProvider())
 
-    service.dispatch(row.id)
+    result = service.dispatch(row.id)
 
-    assert row.status is NotificationStatus.FAILED
+    assert result.action is DispatchAction.RETRY
+    assert result.countdown_seconds == 5
+    assert result.dead_letter is False
+    assert row.status is NotificationStatus.PENDING
+    assert row.retry_count == 1
     assert row.error_message == "vendor 500"
     assert row.sent_at is None
     assert session.commit_calls == 2
 
 
+def test_unclassified_provider_error_is_retryable() -> None:
+    row = _row()
+    service, _session = _service(row, UnclassifiedBoomProvider())
+
+    result = service.dispatch(row.id)
+
+    assert result.action is DispatchAction.RETRY
+    assert row.status is NotificationStatus.PENDING
+
+
+def test_unexpected_exception_is_retryable() -> None:
+    row = _row()
+    service, _session = _service(row, CrashProvider())
+
+    result = service.dispatch(row.id)
+
+    assert result.action is DispatchAction.RETRY
+    assert row.retry_count == 1
+    assert row.status is NotificationStatus.PENDING
+
+
+def test_permanent_error_fails_without_retry() -> None:
+    row = _row()
+    service, session = _service(row, PermanentBoomProvider())
+
+    result = service.dispatch(row.id)
+
+    assert result.action is DispatchAction.FAILED
+    assert result.dead_letter is True
+    assert row.status is NotificationStatus.FAILED
+    assert row.retry_count == 1
+    assert row.error_message == "bad recipient"
+    assert session.commit_calls == 2
+
+
+def test_fifth_transient_failure_is_dead_lettered() -> None:
+    row = _row(retry_count=4)
+    service, _session = _service(row, TransientBoomProvider())
+
+    result = service.dispatch(row.id)
+
+    assert result.action is DispatchAction.FAILED
+    assert result.dead_letter is True
+    assert row.retry_count == 5
+    assert row.status is NotificationStatus.FAILED
+
+
+def test_fourth_retry_uses_capped_countdown() -> None:
+    row = _row(retry_count=3)
+    service, _session = _service(row, TransientBoomProvider())
+
+    result = service.dispatch(row.id)
+
+    assert result.action is DispatchAction.RETRY
+    assert result.countdown_seconds == 45
+    assert row.retry_count == 4
+    assert row.status is NotificationStatus.PENDING
+
+
 def test_missing_row_is_a_noop() -> None:
-    session = FakeSession()
     provider = RecordingProvider()
-    service = DispatchService(session, FakeNotificationRepository(None), provider)
+    service, session = _service(None, provider)
 
-    service.dispatch(uuid.uuid4())
+    result = service.dispatch(uuid.uuid4())
 
+    assert result.action is DispatchAction.MISSING
     assert provider.messages == []
     assert session.commit_calls == 0
 ```
 
-Quita el `import pytest` si no lo usas. Cero `time.sleep`. Cero dominio mockeado: usas la máquina de estados de verdad.
+Si MyPy en tests no corre (`packages = ["app"]`), el `type: ignore[arg-type]` de `_service` es opcional: anota `provider` como `NotificationProvider`.
 
-Crear [`tests/integration/test_dispatch.py`](tests/integration/test_dispatch.py) — Postgres real, provider fake (no Celery vivo):
+Editar [`tests/integration/test_dispatch.py`](tests/integration/test_dispatch.py). El archivo completo queda (Postgres real, provider fake, **cero** `sleep`, **cero** Celery vivo):
 
 ```python
 import uuid
@@ -750,10 +1018,11 @@ from sqlalchemy import Engine
 from app.core.db import create_session_factory
 from app.core.security import generate_api_key, hash_api_key
 from app.domain.enums import Channel, NotificationStatus
+from app.domain.retry_policy import DeliveryRetryPolicy
 from app.models import Client, Notification
-from app.providers.port import OutboundMessage
+from app.providers.port import OutboundMessage, PermanentProviderError, TransientProviderError
 from app.repositories.notification_repository import NotificationRepository
-from app.services.dispatch import DispatchService
+from app.services.dispatch import DispatchAction, DispatchService
 
 
 class RecordingProvider:
@@ -762,6 +1031,25 @@ class RecordingProvider:
 
     def send(self, message: OutboundMessage) -> None:
         self.calls += 1
+
+
+class FailOnceThenSucceed:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def send(self, message: OutboundMessage) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise TransientProviderError("once")
+
+
+class AlwaysPermanent:
+    def send(self, message: OutboundMessage) -> None:
+        raise PermanentProviderError("nope")
+
+
+def _policy() -> DeliveryRetryPolicy:
+    return DeliveryRetryPolicy(max_attempts=5, countdown_seconds=(5, 15, 45))
 
 
 def test_dispatch_persists_sent_and_sent_at(persistence_engine: Engine) -> None:
@@ -793,7 +1081,10 @@ def test_dispatch_persists_sent_and_sent_at(persistence_engine: Engine) -> None:
     try:
         with factory() as session:
             service = DispatchService(
-                session, NotificationRepository(session), provider
+                session,
+                NotificationRepository(session),
+                provider,
+                _policy(),
             )
             service.dispatch(notification_id)
         with factory() as session:
@@ -807,113 +1098,213 @@ def test_dispatch_persists_sent_and_sent_at(persistence_engine: Engine) -> None:
             session.delete(session.get(Notification, notification_id))
             session.delete(session.get(Client, client_id))
             session.commit()
+
+
+def test_dispatch_retries_then_sends(persistence_engine: Engine) -> None:
+    factory = create_session_factory(persistence_engine)
+    provider = FailOnceThenSucceed()
+    notification_id = uuid.uuid4()
+    client_id: uuid.UUID
+    with factory() as session:
+        client = Client(
+            name="dispatch-retry-it",
+            hashed_api_key=hash_api_key(generate_api_key()),
+            is_active=True,
+        )
+        session.add(client)
+        session.flush()
+        client_id = client.id
+        session.add(
+            Notification(
+                id=notification_id,
+                client_id=client_id,
+                channel=Channel.EMAIL,
+                recipient="user@example.com",
+                template="welcome",
+                payload={},
+                status=NotificationStatus.PENDING,
+            )
+        )
+        session.commit()
+    try:
+        with factory() as session:
+            first = DispatchService(
+                session,
+                NotificationRepository(session),
+                provider,
+                _policy(),
+            ).dispatch(notification_id)
+        assert first.action is DispatchAction.RETRY
+        with factory() as session:
+            row = session.get(Notification, notification_id)
+            assert row is not None
+            assert row.status is NotificationStatus.PENDING
+            assert row.retry_count == 1
+        with factory() as session:
+            second = DispatchService(
+                session,
+                NotificationRepository(session),
+                provider,
+                _policy(),
+            ).dispatch(notification_id)
+        assert second.action is DispatchAction.SENT
+        with factory() as session:
+            row = session.get(Notification, notification_id)
+            assert row is not None
+            assert row.status is NotificationStatus.SENT
+            assert row.sent_at is not None
+        assert provider.calls == 2
+    finally:
+        with factory() as session:
+            session.delete(session.get(Notification, notification_id))
+            session.delete(session.get(Client, client_id))
+            session.commit()
+
+
+def test_dispatch_permanent_failure_stays_failed(persistence_engine: Engine) -> None:
+    factory = create_session_factory(persistence_engine)
+    provider = AlwaysPermanent()
+    notification_id = uuid.uuid4()
+    client_id: uuid.UUID
+    with factory() as session:
+        client = Client(
+            name="dispatch-perm-it",
+            hashed_api_key=hash_api_key(generate_api_key()),
+            is_active=True,
+        )
+        session.add(client)
+        session.flush()
+        client_id = client.id
+        session.add(
+            Notification(
+                id=notification_id,
+                client_id=client_id,
+                channel=Channel.EMAIL,
+                recipient="user@example.com",
+                template="welcome",
+                payload={},
+                status=NotificationStatus.PENDING,
+            )
+        )
+        session.commit()
+    try:
+        with factory() as session:
+            result = DispatchService(
+                session,
+                NotificationRepository(session),
+                provider,
+                _policy(),
+            ).dispatch(notification_id)
+        assert result.action is DispatchAction.FAILED
+        assert result.dead_letter is True
+        with factory() as session:
+            row = session.get(Notification, notification_id)
+            assert row is not None
+            assert row.status is NotificationStatus.FAILED
+            assert row.retry_count == 1
+            assert row.sent_at is None
+    finally:
+        with factory() as session:
+            session.delete(session.get(Notification, notification_id))
+            session.delete(session.get(Client, client_id))
+            session.commit()
 ```
 
-- **Patrón:** application service (use case) + repository + state machine. El worker no tiene lógica de negocio pegada al decorador `@task`.
-- **Por qué dos commits:** ejemplo: `GET /status` mientras el simulado “envía” puede mostrar `PROCESSING`. Si saltaras a `SENT` en un solo write, violarías `PENDING → SENT`.
-- **Alternativa descartada:** transicionar dentro de `tasks.py`. La task dejaría de ser serializable-y-tonta; testearla exigiría Celery. El servicio se testea con fakes.
-- **Capa:** `app/services/` + `app/repositories/`. No importa FastAPI ni el módulo de tasks.
+- **Patrón:** application service + state machine + resultado explícito (no excepción Celery en el use case).
+- **Por qué `PROCESSING → PENDING`:** ejemplo: `GET /status` durante los 15 s de espera enseña “sigue en cola”, no “se rompió”. Si te quedaras en `PROCESSING`, un cliente pensaría que el email está saliendo ahora mismo.
+- **Alternativa descartada:** `raise self.retry()` **dentro** de `DispatchService`. El servicio importaría Celery y los unit tests necesitarían un worker. El charter: retry policy en worker/task; la **decisión** (sí/no + segundos) es de dominio/servicio.
+- **Capa:** `app/services/`. No importa `app.workers` ni routers.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-feat: dispatch PENDING notifications through the provider port
+feat: retry transient dispatch failures with backoff
 
-Persist PROCESSING then SENT in the application service so the
-worker task stays a thin id-only entrypoint.
+Return PENDING plus a countdown so the worker can reschedule
+without the application service importing Celery.
 ```
 
 ---
 
-### Paso 9.4 — Celery app + task + adapter de cola
+### Paso 10.4 — Celery `bind=True`, retry y DLQ
 
-Crear [`app/workers/celery_app.py`](app/workers/celery_app.py). Responsabilidad: configurar Celery. Quién lo arranca: CLI `celery -A …`. **No** importa routers.
-
-```python
-"""Celery application. Broker is Redis index 1; results are ignored (Postgres wins)."""
-
-from celery import Celery
-from kombu import Queue
-
-from app.core.config import get_settings
-
-_settings = get_settings()
-
-celery_app = Celery("notifications_engine", include=["app.workers.tasks"])
-celery_app.conf.update(
-    broker_url=_settings.celery_broker_url.get_secret_value(),
-    result_backend=None,
-    task_ignore_result=True,
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    task_acks_late=True,
-    worker_prefetch_multiplier=1,
-    task_default_queue="notifications",
-    task_queues=(Queue("notifications"),),
-    timezone="UTC",
-    enable_utc=True,
-    task_acks_on_failure_or_timeout=True,
-)
-```
-
-Si MyPy se queja de `celery` / `kombu`, añade en este archivo (no un paquete extra):
+Editar [`app/workers/celery_app.py`](app/workers/celery_app.py). Cambia **solo** `task_queues`:
 
 ```python
-from celery import Celery  # type: ignore[import-untyped]
-from kombu import Queue  # type: ignore[import-untyped]
+    task_queues=(
+        Queue("notifications"),
+        Queue("notifications.dlq"),
+    ),
 ```
 
-Solo esos dos ignores, no `mypy ignore_missing_imports` global.
+El resto del `conf.update` **no se toca** (`task_acks_late=True`, JSON, sin result backend, default queue `notifications`).
 
-Crear [`app/workers/runtime.py`](app/workers/runtime.py):
-
-```python
-"""Worker composition root: one engine per process, one session per task."""
-
-from __future__ import annotations
-
-from sqlalchemy import Engine
-from sqlalchemy.orm import Session, sessionmaker
-
-from app.core.config import get_settings
-from app.core.db import create_engine_from_url, create_session_factory
-from app.core.logging import configure_logging
-
-_engine: Engine | None = None
-_session_factory: sessionmaker[Session] | None = None
-
-
-def get_worker_session_factory() -> sessionmaker[Session]:
-    """Lazily build the worker engine. FastAPI lifespan must not call this."""
-    global _engine, _session_factory
-    if _session_factory is None:
-        settings = get_settings()
-        configure_logging(settings)
-        _engine = create_engine_from_url(settings.database_url.get_secret_value())
-        _session_factory = create_session_factory(_engine)
-    return _session_factory
-```
-
-Crear [`app/workers/tasks.py`](app/workers/tasks.py):
+Editar [`app/workers/tasks.py`](app/workers/tasks.py). El archivo completo queda:
 
 ```python
 """Celery tasks. Payloads are ids; work lives in DispatchService."""
 
 from __future__ import annotations
 
+import logging
 import uuid
+from collections.abc import Callable
+from typing import Any
 
+from app.core.config import get_settings
+from app.domain.retry_policy import DeliveryRetryPolicy
 from app.providers.simulated import SimulatedNotificationProvider
 from app.repositories.notification_repository import NotificationRepository
-from app.services.dispatch import DispatchService
+from app.services.dispatch import DispatchAction, DispatchResult, DispatchService
 from app.workers.celery_app import celery_app
 from app.workers.runtime import get_worker_session_factory
 
+logger = logging.getLogger("app.workers.tasks")
 
-@celery_app.task(name="notifications.deliver", ignore_result=True, max_retries=0)
-def deliver_notification(notification_id: str) -> None:
+
+@celery_app.task(name="notifications.dead_letter", ignore_result=True, max_retries=0)  # type: ignore[untyped-decorator]
+def record_dead_letter(notification_id: str) -> None:
+    """Log a failed id for inspection. Never call a provider."""
+    logger.warning(
+        "notification_dead_lettered",
+        extra={"notification_id": notification_id},
+    )
+
+
+def apply_delivery_result(
+    task: Any,
+    result: DispatchResult,
+    notification_id: str,
+    *,
+    max_retries: int,
+    publish_dead_letter: Callable[..., Any] | None = None,
+) -> None:
+    """Map a DispatchResult onto Celery retry or the DLQ. Tested without a live worker."""
+    if result.action is DispatchAction.RETRY:
+        countdown = result.countdown_seconds if result.countdown_seconds is not None else 5
+        raise task.retry(countdown=countdown, max_retries=max_retries)
+    if result.dead_letter:
+        publish = publish_dead_letter
+        if publish is None:
+            publish = record_dead_letter.apply_async
+        try:
+            publish(args=[notification_id], queue="notifications.dlq")
+        except Exception:
+            logger.exception(
+                "notification_dlq_publish_failed",
+                extra={"notification_id": notification_id},
+            )
+
+
+@celery_app.task(bind=True, name="notifications.deliver", ignore_result=True)  # type: ignore[untyped-decorator]
+def deliver_notification(self: Any, notification_id: str) -> None:
     """Load the row and dispatch. Never import FastAPI routers."""
+    settings = get_settings()
+    policy = DeliveryRetryPolicy(
+        max_attempts=settings.max_delivery_attempts,
+        countdown_seconds=settings.delivery_retry_countdowns,
+    )
+    result: DispatchResult | None = None
     factory = get_worker_session_factory()
     session = factory()
     try:
@@ -921,248 +1312,198 @@ def deliver_notification(notification_id: str) -> None:
             session=session,
             repository=NotificationRepository(session),
             provider=SimulatedNotificationProvider(),
+            policy=policy,
         )
-        service.dispatch(uuid.UUID(notification_id))
+        result = service.dispatch(uuid.UUID(notification_id))
     finally:
         session.close()
+    if result is not None:
+        apply_delivery_result(
+            self,
+            result,
+            notification_id,
+            max_retries=settings.max_delivery_attempts - 1,
+        )
 ```
 
 Editar [`app/workers/__init__.py`](app/workers/__init__.py):
 
 ```python
-"""Celery workers. Tasks receive notification ids, never ORM objects or HTTP."""
+"""Celery workers. Tasks receive notification ids; retries and DLQ live here."""
 ```
 
-Editar [`app/services/queue.py`](app/services/queue.py). El Protocol y `InMemoryNotificationQueue` **se quedan**. Añade el adapter Celery al final. El archivo completo queda:
-
-```python
-"""Queue port for accepted notifications.
-
-The HTTP path enqueues an id; it never talks to a provider.
-InMemoryNotificationQueue is the test adapter. CeleryNotificationQueue is local/prod.
-"""
-
-from __future__ import annotations
-
-import uuid
-from collections.abc import Callable
-from typing import Any, Protocol
-
-
-class QueueUnavailableError(Exception):
-    """Raised when enqueue cannot complete. HTTP handler maps this to 503."""
-
-
-class NotificationQueue(Protocol):
-    """Application-owned port: accept a notification id for later dispatch."""
-
-    def enqueue(self, notification_id: uuid.UUID) -> None:
-        """Record ``notification_id``. Must not send the notification.
-
-        Adapters may raise ``QueueUnavailableError``.
-        """
-        ...
-
-
-class InMemoryNotificationQueue:
-    """Process-local list. Lost on restart; Postgres still holds PENDING rows."""
-
-    def __init__(self) -> None:
-        self.enqueued: list[uuid.UUID] = []
-
-    def enqueue(self, notification_id: uuid.UUID) -> None:
-        self.enqueued.append(notification_id)
-
-
-class CeleryNotificationQueue:
-    """Publish notification ids to the Celery ``notifications`` queue."""
-
-    def __init__(self, apply_async: Callable[..., Any] | None = None) -> None:
-        self._apply_async = apply_async
-
-    def enqueue(self, notification_id: uuid.UUID) -> None:
-        publish = self._apply_async
-        if publish is None:
-            from app.workers.tasks import deliver_notification
-
-            publish = deliver_notification.apply_async
-        try:
-            publish(args=[str(notification_id)], queue="notifications")
-        except QueueUnavailableError:
-            raise
-        except Exception as exc:
-            raise QueueUnavailableError() from exc
-```
-
-Editar [`app/services/__init__.py`](app/services/__init__.py):
-
-```python
-"""Application services: use cases orchestrating domain and ports."""
-
-from app.services.dispatch import DispatchService
-from app.services.metrics_service import MetricsService
-from app.services.notification_service import NotificationService
-from app.services.queue import (
-    CeleryNotificationQueue,
-    InMemoryNotificationQueue,
-    NotificationQueue,
-    QueueUnavailableError,
-)
-
-__all__ = [
-    "CeleryNotificationQueue",
-    "DispatchService",
-    "InMemoryNotificationQueue",
-    "MetricsService",
-    "NotificationQueue",
-    "NotificationService",
-    "QueueUnavailableError",
-]
-```
-
-Editar [`app/main.py`](app/main.py). Import de cola: deja `InMemoryNotificationQueue` y `QueueUnavailableError`. **No** importes `CeleryNotificationQueue` arriba (evita arrancar Celery en cada test). Dentro de `lifespan`, **reemplaza** la línea que asigna `notification_queue`:
-
-```python
-    if settings.environment == "test":
-        application.state.notification_queue = InMemoryNotificationQueue()
-    else:
-        from app.services.queue import CeleryNotificationQueue
-
-        application.state.notification_queue = CeleryNotificationQueue()
-```
-
-El Redis del Token Bucket **no cambia** (sigue FakeRedis en test, índice 0 en local).
-
-Editar el docstring de [`app/api/routers/notifications.py`](app/api/routers/notifications.py) (primera línea):
-
-```python
-"""Accept-send and status probe. The worker process dispatches; this router does not."""
-```
-
-El body de los endpoints **no se toca**.
-
-Crear [`tests/unit/test_celery_queue.py`](tests/unit/test_celery_queue.py):
+**No** crear `tests/unit/workers/__init__.py` (pytest usa `importlib`). Crear [`tests/unit/workers/test_apply_delivery_result.py`](tests/unit/workers/test_apply_delivery_result.py):
 
 ```python
 from __future__ import annotations
-
-import uuid
 
 import pytest
 
-from app.services.queue import CeleryNotificationQueue, QueueUnavailableError
+from app.services.dispatch import DispatchAction, DispatchResult
+from app.workers.tasks import apply_delivery_result
 
 
-def test_enqueue_publishes_str_id_on_notifications_queue() -> None:
+class FakeRetry(Exception):
+    def __init__(self, countdown: int, max_retries: int) -> None:
+        self.countdown = countdown
+        self.max_retries = max_retries
+
+
+class FakeTask:
+    def retry(self, countdown: int, max_retries: int) -> None:
+        raise FakeRetry(countdown, max_retries)
+
+
+def test_retry_result_raises_task_retry() -> None:
+    with pytest.raises(FakeRetry) as exc_info:
+        apply_delivery_result(
+            FakeTask(),
+            DispatchResult(DispatchAction.RETRY, countdown_seconds=15),
+            "nid",
+            max_retries=4,
+        )
+    assert exc_info.value.countdown == 15
+    assert exc_info.value.max_retries == 4
+
+
+def test_failed_result_publishes_to_dlq_queue() -> None:
     seen: dict[str, object] = {}
 
-    def fake_apply_async(*, args: list[str], queue: str) -> None:
+    def fake_publish(*, args: list[str], queue: str) -> None:
         seen["args"] = args
         seen["queue"] = queue
 
-    notification_id = uuid.uuid4()
-    CeleryNotificationQueue(apply_async=fake_apply_async).enqueue(notification_id)
+    apply_delivery_result(
+        FakeTask(),
+        DispatchResult(DispatchAction.FAILED, dead_letter=True),
+        "nid-1",
+        max_retries=4,
+        publish_dead_letter=fake_publish,
+    )
+    assert seen["args"] == ["nid-1"]
+    assert seen["queue"] == "notifications.dlq"
 
-    assert seen["args"] == [str(notification_id)]
-    assert seen["queue"] == "notifications"
+
+def test_sent_result_is_a_noop() -> None:
+    def boom(*, args: list[str], queue: str) -> None:
+        raise AssertionError("DLQ must not run on SENT")
+
+    apply_delivery_result(
+        FakeTask(),
+        DispatchResult(DispatchAction.SENT),
+        "nid",
+        max_retries=4,
+        publish_dead_letter=boom,
+    )
 
 
-def test_enqueue_wraps_broker_errors() -> None:
+def test_dlq_publish_failure_is_logged_not_raised() -> None:
     def boom(*, args: list[str], queue: str) -> None:
         raise ConnectionError("broker down")
 
-    with pytest.raises(QueueUnavailableError):
-        CeleryNotificationQueue(apply_async=boom).enqueue(uuid.uuid4())
+    apply_delivery_result(
+        FakeTask(),
+        DispatchResult(DispatchAction.FAILED, dead_letter=True),
+        "nid",
+        max_retries=4,
+        publish_dead_letter=boom,
+    )
 ```
 
-[`tests/integration/test_send.py`](tests/integration/test_send.py) **sigue** afirmando `isinstance(queue, InMemoryNotificationQueue)` y status `PENDING`. Si eso se pone rojo, el lifespan de test está mal (D12).
+[`tests/unit/test_celery_queue.py`](tests/unit/test_celery_queue.py) **no se toca**: el accept path sigue publicando solo a `notifications`.
 
-Cero worker vivo en pytest. Cero `task_always_eager` global.
+Cero worker vivo. Cero `task_always_eager`. Cero `time.sleep`.
 
-- **Patrón:** adapter del puerto de cola + task id-only + composition root del worker.
-- **Por qué JSON y no pickle:** ejemplo: un pickle ejecuta clases al deserializar. JSON solo mueve el string del UUID. A esta escala no necesitamos speed de pickle.
-- **Por qué `acks_late`:** ejemplo: el worker muere después de marcar `PROCESSING` y antes de acabar. Si ack-eara al empezar, el ticket se perdería. Con ack al final, Redis lo reentrega; `SENT`/`FAILED` evitan un segundo email si ya terminó.
-- **Alternativa descartada:** `BackgroundTasks` de FastAPI. Muere con el proceso; no hay rail. El charter lo prohíbe.
-- **Capa:** `app/workers/` (Celery) + `app/services/queue.py` (adapter). Routers no importan Celery.
+- **Patrón:** task tonta + función pura `apply_delivery_result` (fácil de testear) + cola nombrada DLQ.
+- **Por qué Redis no “trae DLQ de fábrica”:** ejemplo: RabbitMQ tiene *dead-letter exchange*. Redis-as-broker no. Nosotros **publicamos** a una cola con nombre, como un segundo rail de tickets rotos. Eso es una convención del proyecto, no magia de Celery.
+- **Por qué `max_retries=max_attempts - 1`:** Celery cuenta *reintentos*, no el intento inicial. 1 + 4 = 5. El presupuesto **real** sigue siendo Postgres `retry_count` vs `max_delivery_attempts` (D4). Celery es el cinturón.
+- **Alternativa descartada:** `task_always_eager=True` para “probar retries”. Rompería los tests HTTP de `PENDING` y enseñaría un modo que **no** usamos en local.
+- **Capa:** `app/workers/`. No importa routers. `DispatchService` no importa este módulo.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-feat: enqueue accepted notifications onto Celery
+feat: reschedule transient failures and publish exhausted ids to DLQ
 
-Keep FastAPI on the 202 path and let a second venv process
-dispatch ids through Redis index 1.
+Keep Celery on countdown retries and a named notifications.dlq
+queue so failed work is inspectable without an admin UI.
 ```
 
 ---
 
-### Paso 9.5 — Docs de status + README
-
-Editar [`docs/STATUS.md`](docs/STATUS.md) **solo al cerrar la implementación** (otro turno). Este turno de PLAN **no** marca Fase 9 hecha. Cuando el código exista:
-
-- Marcar Fase 9 hecha: Celery en el venv, broker `/1`, provider simulado, `DispatchService`, `PENDING → PROCESSING → SENT`, tests sin worker vivo.
-- Decir qué **sigue**: Fase 10 = retries 5s/15s/45s + `FAILED` + cola `notifications.dlq`.
-- “Qué no existe” **deja de listar** Celery / provider simulado. Sigue incluyendo DLQ, Beat, Docker, mapper de `InvalidStatusTransition`, Mailtrap/Twilio reales.
-- No marcar Fase 10 como hecha.
+### Paso 10.5 — README + STATUS (STATUS solo al cerrar el código)
 
 Editar [`README.md`](README.md) **en la implementación**:
 
-- Status: “Phase 9: Celery worker in the same venv + simulated provider; FastAPI still returns 202 PENDING; poll GET /status until SENT”.
-- `.env`: `CELERY_BROKER_URL=redis://localhost:6379/1` (distinto de `REDIS_URL` `/0`).
-- Run: **dos** procesos:
+- Status: “Phase 10: retries 5s/15s/45s (cap 45s), max 5 attempts, `FAILED` + queue `notifications.dlq`”.
+- Worker:
 
 ```bash
-# terminal 1
-uvicorn app.main:app --reload --port 8000
-
-# terminal 2 (same venv, repo root, .env present)
-celery -A app.workers.celery_app worker --loglevel=INFO --queues=notifications
+celery -A app.workers.celery_app worker --loglevel=INFO --queues=notifications,notifications.dlq
 ```
 
-- Después del curl de send, documentar poll de status y metrics:
+- Después del curl feliz (`template: welcome` → poll `SENT`), documentar los dos demos:
 
 ```bash
-curl -i -H "X-API-Key: PASTE_RAW_KEY" \
-  http://127.0.0.1:8000/api/v1/notifications/NOTIFICATION_ID/status
-# 200 {"notification_id":"...","status":"SENT"}   # after the worker runs
+# Transient: worker retries (5s, 15s, 45s, 45s) then FAILED + DLQ log
+curl -i -H "X-API-Key: PASTE_RAW_KEY" -H "Content-Type: application/json" \
+  -d '{"channel":"email","recipient":"user@example.com","template":"fail-transient"}' \
+  http://127.0.0.1:8000/api/v1/notifications/send
+# poll GET /status: PENDING between attempts, then FAILED
+# GET /metrics → failed increments only after FAILED
 
-curl -i -H "X-API-Key: PASTE_RAW_KEY" http://127.0.0.1:8000/api/v1/metrics
-# 200 {"sent":1,"failed":0}
+# Permanent: FAILED on the first attempt, no 5s wait
+curl -i -H "X-API-Key: PASTE_RAW_KEY" -H "Content-Type: application/json" \
+  -d '{"channel":"email","recipient":"nobody@example.com","template":"fail-permanent"}' \
+  http://127.0.0.1:8000/api/v1/notifications/send
 ```
 
-- Dejar claro: sin el proceso worker, `GET /status` se queda `PENDING` (eso es correcto). pytest **no** arranca Celery. Docker sigue “fase posterior”. Retries/DLQ no están.
+- `.env`: `MAX_DELIVERY_ATTEMPTS=5`, `DELIVERY_RETRY_COUNTDOWNS=5,15,45`.
+- Dejar claro: pytest **no** espera el backoff. Docker sigue “fase posterior”. Beat / replay admin / Twilio **no** están.
+- El diagrama mermaid **ya** tiene caja DLQ: quita la frase “the DLQ box is the target shape, not this phase” y di que la DLQ es la cola `notifications.dlq` (inspección por log + fila `FAILED`).
+
+Si existe [`docs/EXPLANATIONS.md`](docs/EXPLANATIONS.md) en la máquina de EsrgaN, **enriquece** (retries, transiente vs permanente, por qué Redis no tiene DLX). **Nunca** lo commitees (`.gitignore`).
+
+Editar [`docs/STATUS.md`](docs/STATUS.md) **solo al cerrar la implementación** (otro turno). Este turno de PLAN **no** marca Fase 10 hecha. Cuando el código exista:
+
+- Marcar Fase 10 hecha: backoff 5/15/45 (tope 45), 5 intentos, `PROCESSING → PENDING` en retry, `FAILED` + `notifications.dlq`.
+- Decir qué **sigue**: Fase 11 = README / curl polish (runbook local). No Compose.
+- “Qué no existe” **deja de listar** retries/DLQ. Sigue incluyendo Beat, replay admin, Docker, mapper de `InvalidStatusTransition`, Mailtrap/Twilio reales.
+- No marcar Fase 11 como hecha.
 
 - **Commit (si EsrgaN autoriza):**
 
 ```text
-docs: record the local Celery worker and SENT poll
+docs: record retries, DLQ, and simulated fail templates
 ```
 
 ---
 
 ## 4. Checklist de cierre
 
-- [ ] `pytest -q` verde (90 anteriores + config broker + simulado + dispatch unit + dispatch Postgres + celery queue)
-- [ ] `ruff check app tests` limpio
+- [ ] `pytest -q` verde (105 anteriores adaptados + policy + config CSV + simulado fail + dispatch retry/permanente/agotado + apply_delivery_result + integración transiente→SENT y permanente→FAILED)
+- [ ] `ruff check app tests` limpio; `mypy app` limpio
 - [ ] `app/domain/` sigue sin importar FastAPI/SQLAlchemy/Redis/Celery/Pydantic
 - [ ] Routers **no** importan `app.workers` ni providers; `NotificationService.accept` intacto
-- [ ] Worker **no** importa `app.api.routers`
+- [ ] Worker **no** importa `app.api.routers`; `DispatchService` **no** importa Celery
 - [ ] Cero `create_all`, cero migración nueva, cero `commit` en `get_db`
 - [ ] HTTP test env: `POST /send` sigue 202 `PENDING` e `InMemoryNotificationQueue`
-- [ ] `DispatchService`: PENDING→SENT (2 commits), skip SENT/FAILED, PROCESSING recovery, missing noop, ProviderError→FAILED
-- [ ] Integración Postgres: fila acaba `SENT` con `sent_at` no nulo
-- [ ] `CeleryNotificationQueue` publica `str(id)` en queue `notifications`; error de broker → `QueueUnavailableError`
+- [ ] Transiente: `PENDING` + `retry_count++` + countdown 5/15/45/45; 5.º fallo → `FAILED` + `dead_letter`
+- [ ] Permanente: `FAILED` en el primer golpe, sin countdown
+- [ ] `ProviderError` pelado y `RuntimeError` son **reintentables** (los tests viejos de FAILED inmediato están **reescritos**)
+- [ ] Skip `SENT`/`FAILED`; missing noop; recovery desde `PROCESSING`
+- [ ] DLQ publish a queue `notifications.dlq` con `str(id)`; fallo de publish se loguea, no revienta
 - [ ] `GET /health` sigue 200 sin API key y sin I/O a Redis/Celery
-- [ ] Token Bucket intacto (índice 0); broker es índice 1
-- [ ] Cero `time.sleep`, cero worker vivo en pytest, cero `task_always_eager` global, cero Twilio, cero JWT, cero Docker, cero DLQ, cero Beat
-- [ ] README: uvicorn + celery en el mismo venv; curl de status `SENT`
-- [ ] 3–6 learning points en español **simple** para EsrgaN (mostrador vs cocina, por qué id y no ORM, por qué `/1` ≠ `/0`, por qué simulado, por qué InMemory en tests, por qué `PENDING → PROCESSING → SENT` y no un salto)
+- [ ] Token Bucket intacto (índice 0); broker índice 1
+- [ ] Cero `time.sleep`, cero worker vivo en pytest, cero `task_always_eager` global, cero Twilio, cero JWT, cero Docker, cero Beat
+- [ ] README: worker con ambas colas; curl `fail-transient` / `fail-permanent`
+- [ ] 3–6 learning points en español **simple** para EsrgaN (retry vs permanente, backoff con tope, por qué PENDING otra vez, por qué DLQ es una cola nombrada y no magia de Redis, por qué el servicio no importa Celery, por qué 5 intentos = `max_retries` Celery 4)
 - [ ] Commits hechos o mensajes esperando a EsrgaN
 
-**Prohibido al terminar:** retries/DLQ, `import twilio`, Compose, mapper HTTP de transiciones, mezclar cubo y broker en `/0`, `BackgroundTasks`, eager por defecto.
+**Prohibido al terminar:** Beat, `import twilio`, Compose, mapper HTTP de transiciones, `BackgroundTasks`, eager por defecto, 135 s de espera, UI de replay.
 
 ---
 
 ## 5. Qué sigue (no implementar)
 
-Siguiente `PLAN.md` (otra reescritura): **retries + DLQ** (5s / 15s / 45s, máximo 5 intentos, `FAILED` + cola `notifications.dlq`). El worker de esta fase ya despacha el camino feliz. No implementar retries, DLQ, Beat, Docker ni providers reales en este turno.
+Siguiente `PLAN.md` (otra reescritura): **README / curl polish** (runbook local, Fase 11). Esta fase ya deja retries + DLQ. No implementar README “de portfolio”, Compose, Beat ni providers reales en este turno.
