@@ -6,20 +6,25 @@ dispatches through a **simulated** channel adapter, and Redis Token Bucket rate
 limiting protects the HTTP path. **Day-to-day development is a local Python 3.12
 venv** — not Docker.
 
-> **Phase 9:** Celery worker in the same venv + simulated provider. FastAPI still
-> returns **202 PENDING**. Poll `GET /status` until **SENT**. Token Bucket in local
-> Redis (`/0`); the Celery broker is the **same** Redis on index **`/1`**.
-> `GET /health` does not talk to Redis or Celery. `X-API-Key` remains required on
-> product routes. Retries / DLQ are not in this phase.
+> **Phase 10:** retries **5s / 15s / 45s** (cap 45s), max **5** attempts, then
+> `FAILED` + queue `notifications.dlq`. FastAPI still returns **202 PENDING**.
+> Poll `GET /status` until **SENT** (or **FAILED** after exhaustion / a permanent
+> error). Token Bucket in local Redis (`/0`); the Celery broker is the **same**
+> Redis on index **`/1`**. `GET /health` does not talk to Redis or Celery.
+> `X-API-Key` remains required on product routes.
 
 ## Target architecture
 
 Today the HTTP path is health + request-id + API key auth, Token Bucket on
 `POST /send` (429 after the burst), accept-send (persist `PENDING`, enqueue the
 id onto Celery, return `202`). A second process (`celery worker`) loads the row,
-marks `PROCESSING`, calls the simulated provider, and marks `SENT`. `GET /metrics`
-counts Postgres `SENT` vs `FAILED` for that key — `sent` moves **after** the
-worker runs, not on the same request. The in-memory queue is used only in pytest.
+marks `PROCESSING`, calls the simulated provider, and marks `SENT` — or, on a
+**transient** provider failure, waits 5s/15s/45s (cap 45s) and retries up to 5
+attempts. After exhaustion or a **permanent** failure the row is `FAILED` and the
+id is published to the named queue `notifications.dlq` (inspect via log + the
+Postgres row; not an admin UI). `GET /metrics` counts Postgres `SENT` vs `FAILED`
+for that key — `failed` increments **only** when the row is `FAILED`, not on each
+retry. The in-memory queue is used only in pytest.
 
 ```mermaid
 flowchart LR
@@ -34,8 +39,9 @@ flowchart LR
   Worker --> DLQ[DeadLetterQueue]
 ```
 
-Retries, DLQ, and real Mailtrap/Twilio adapters are later phases. The DLQ box
-in the diagram is the target shape, not this phase.
+The DLQ box is the named Celery/Kombu queue `notifications.dlq`: inspection via
+the `notification_dead_lettered` log line plus the Postgres `FAILED` row. Real
+Mailtrap/Twilio adapters, Celery Beat, and an admin replay UI are later phases.
 
 ## Prerequisites
 
@@ -81,6 +87,8 @@ Edit `.env`:
 - `REDIS_URL=redis://localhost:6379/0` (Token Bucket; required).
 - `CELERY_BROKER_URL=redis://localhost:6379/1` (Celery tickets; **not** `/0`).
 - `RATE_LIMIT_PER_MINUTE=10` (optional; default is 10).
+- `MAX_DELIVERY_ATTEMPTS=5` (optional; default is 5).
+- `DELIVERY_RETRY_COUNTDOWNS=5,15,45` (optional; extra attempts cap at 45s).
 
 Apply migrations (creates `clients` and `notifications`):
 
@@ -123,7 +131,7 @@ You need **two** processes in the **same** venv (repo root, `.env` present).
 uvicorn app.main:app --reload --port 8000
 
 # terminal 2
-celery -A app.workers.celery_app worker --loglevel=INFO --queues=notifications
+celery -A app.workers.celery_app worker --loglevel=INFO --queues=notifications,notifications.dlq
 ```
 
 ```bash
@@ -161,23 +169,38 @@ curl -i -H "X-API-Key: PASTE_RAW_KEY" -H "Content-Type: application/json" \
   http://127.0.0.1:8000/api/v1/notifications/send
 # 429 {"detail":"Rate limit exceeded","code":"rate_limited"}
 # Retry-After: 6
+
+# Transient: worker retries (5s, 15s, 45s, 45s) then FAILED + DLQ log
+curl -i -H "X-API-Key: PASTE_RAW_KEY" -H "Content-Type: application/json" \
+  -d '{"channel":"email","recipient":"user@example.com","template":"fail-transient"}' \
+  http://127.0.0.1:8000/api/v1/notifications/send
+# poll GET /status: PENDING between attempts, then FAILED
+# GET /metrics → failed increments only after FAILED
+
+# Permanent: FAILED on the first attempt, no 5s wait
+curl -i -H "X-API-Key: PASTE_RAW_KEY" -H "Content-Type: application/json" \
+  -d '{"channel":"email","recipient":"nobody@example.com","template":"fail-permanent"}' \
+  http://127.0.0.1:8000/api/v1/notifications/send
 ```
 
 `/health` stays public (no `X-API-Key`). Product routes under `/api/v1/` require it.
 `GET /health`, `GET /status`, and `GET /metrics` do **not** spend Token Bucket tokens.
 
-**No real email goes out.** The simulated provider logs `simulated_send` and returns.
-`202` means the row is stored as `PENDING` and the id was published to Redis index 1.
-Without the worker process, `GET /status` stays `PENDING` (Postgres still has the
-row). **`POST /send` does not move `sent` or `failed`** — those counts change when
-the worker marks the row `SENT` or `FAILED`. Retries and DLQ are not implemented.
+**No real email goes out.** The simulated provider logs `simulated_send` and returns
+unless the template is exactly `fail-transient` or `fail-permanent`. `202` means
+the row is stored as `PENDING` and the id was published to Redis index 1. FastAPI
+**does not wait** for backoff. Without the worker process, `GET /status` stays
+`PENDING` (Postgres still has the row). **`POST /send` does not move `sent` or
+`failed`** — those counts change when the worker marks the row `SENT` or `FAILED`.
+Celery Beat, admin replay, and Twilio/Mailtrap are not implemented.
 
 ## Tests
 
 Persistence and auth tests need the test database and a reachable Postgres.
 HTTP rate-limit tests use FakeRedis (`ENVIRONMENT=test`); they do **not** need
 `brew services start redis`. Pytest uses the in-memory queue and does **not**
-start a Celery worker (no `task_always_eager` on the HTTP fixture).
+start a Celery worker (no `task_always_eager` on the HTTP fixture). Pytest
+**does not** `sleep` through the 5s/15s/45s backoff — it asserts the countdown.
 
 ```bash
 # Optional override if the default URL needs a user/password:
