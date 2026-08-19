@@ -33,7 +33,12 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     engine = create_engine_from_url(settings.database_url.get_secret_value())
     application.state.engine = engine
     application.state.session_factory = create_session_factory(engine)
-    application.state.notification_queue = InMemoryNotificationQueue()
+    if settings.environment == "test":
+        application.state.notification_queue = InMemoryNotificationQueue()
+    else:
+        from app.services.queue import CeleryNotificationQueue
+
+        application.state.notification_queue = CeleryNotificationQueue()
 
     if settings.environment == "test":
         from fakeredis import FakeRedis

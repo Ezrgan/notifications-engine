@@ -35,6 +35,24 @@ def test_create_inserts_pending_row(db_session: Session) -> None:
     assert row.id is not None
 
 
+def test_get_by_id_returns_row_without_client_filter(db_session: Session) -> None:
+    owner = _client(db_session)
+    repo = NotificationRepository(db_session)
+    row = repo.create(
+        client_id=owner.id,
+        channel=Channel.EMAIL,
+        recipient="user@example.com",
+        template="welcome",
+        payload={},
+        idempotency_key=None,
+    )
+    db_session.flush()
+    loaded = repo.get_by_id(row.id)
+    assert loaded is not None
+    assert loaded.id == row.id
+    assert repo.get_by_id(uuid.uuid4()) is None
+
+
 def test_get_by_id_for_client_hides_other_clients_row(db_session: Session) -> None:
     owner = _client(db_session)
     other = _client(db_session)
