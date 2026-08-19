@@ -14,6 +14,7 @@ os.environ["DATABASE_URL"] = os.environ.get(
 os.environ.setdefault("SECRET_KEY", "pytest-secret-key")
 os.environ.setdefault("ENVIRONMENT", "test")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+os.environ.setdefault("CELERY_BROKER_URL", "redis://localhost:6379/1")
 os.environ.setdefault("RATE_LIMIT_PER_MINUTE", "10")
 
 import pytest

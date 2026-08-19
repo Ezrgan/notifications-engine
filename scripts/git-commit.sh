@@ -19,7 +19,7 @@ fi
 git add "$@"
 /usr/bin/git commit -F "$msg_file"
 
-if /usr/bin/git log -1 --format=%B | grep -qi 'co-authored-by'; then
+if /usr/bin/git log -1 --format=%B | grep -qiE '^Co-authored-by:'; then
   echo "error: commit message contains a Co-authored-by trailer" >&2
   exit 1
 fi
