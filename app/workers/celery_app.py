@@ -18,7 +18,10 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     task_default_queue="notifications",
-    task_queues=(Queue("notifications"),),
+    task_queues=(
+        Queue("notifications"),
+        Queue("notifications.dlq"),
+    ),
     timezone="UTC",
     enable_utc=True,
     task_acks_on_failure_or_timeout=True,
