@@ -1,1 +1,1 @@
-"""Celery workers and task definitions. Empty in phase 1."""
+"""Celery workers. Tasks receive notification ids, never ORM objects or HTTP."""
